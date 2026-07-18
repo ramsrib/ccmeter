@@ -8,6 +8,8 @@ Two small meters for people who live in **Claude Code** and **Codex**:
 
 Different budgets, same question: *do I have room to start this?*
 
+**`ccmeter`** — what's left of the subscription, per window:
+
 ```
 $ ccmeter
 Claude max  · live
@@ -17,7 +19,11 @@ Claude max  · live
 
 Codex pro  · snapshot 4m ago
   weekly      9%  █░░░░░░░░░  resets in 6d 9h · 08:25 PM
+```
 
+**`ctxmeter`** — how full this session's context window is:
+
+```
 $ ctxmeter
   9b6977e9 dotfiles          23%  ██░░░░░░░░  232k / 1000k · just now
 ```
