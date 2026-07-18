@@ -1,0 +1,25 @@
+#!/bin/sh
+# Prefer bun (~13ms startup), fall back to node (~39ms + type-stripping).
+# Both run the TypeScript directly — there is no build step.
+set -e
+
+# Resolve this script through any symlink chain: Homebrew and dotfiles both put
+# it on $PATH that way, and `readlink -f` is not portable to older macOS.
+self="$0"
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case "$link" in
+    /*) self="$link" ;;
+    *) self="$(dirname "$self")/$link" ;;
+  esac
+done
+dir="$(cd "$(dirname "$self")/.." && pwd)"
+script="$dir/src/ctxmeter.ts"
+
+if command -v bun >/dev/null 2>&1; then
+  exec bun "$script" "$@"
+elif command -v node >/dev/null 2>&1; then
+  exec node "$script" "$@"
+fi
+echo "ctxmeter: needs bun or node on PATH (node >= 22.18, or any bun)" >&2
+exit 127
