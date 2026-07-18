@@ -19,11 +19,12 @@
  * Flags: --json | --limit N | --threshold N (exit 1 at/above N%) | --transcript P
  */
 import { parseArgs } from "node:util";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { Glob } from "bun";
-import { bar, colorEnabled, humanAgo, makeStyle, pct, severityColor, type Style } from "./lib/format";
+import { open, readFile, stat } from "node:fs/promises";
+import { jsonlOneLevel } from "./lib/walk.ts";
+import { bar, colorEnabled, humanAgo, makeStyle, pct, severityColor, type Style } from "./lib/format.ts";
 
 const SMALL_WINDOW = 200_000;
 const LARGE_WINDOW = 1_000_000;
@@ -63,7 +64,7 @@ function configuredWindow(): number {
   ]) {
     if (!existsSync(p)) continue;
     try {
-      const model = JSON.parse(require("node:fs").readFileSync(p, "utf8")).model;
+      const model = JSON.parse(readFileSync(p, "utf8")).model;
       if (typeof model === "string" && model.includes("[1m]")) return LARGE_WINDOW;
     } catch {
       // unreadable / malformed — fall through to the default
@@ -76,16 +77,15 @@ const PROJECTS = join(homedir(), ".claude", "projects");
 
 async function transcriptForSession(id: string): Promise<string | null> {
   if (!existsSync(PROJECTS)) return null;
-  for await (const p of new Glob(`*/${id}.jsonl`).scan({ cwd: PROJECTS, absolute: true })) return p;
-  return null;
+  const hits = await jsonlOneLevel(PROJECTS, (name) => name === `${id}.jsonl`);
+  return hits[0] ?? null;
 }
 
 /** Every transcript, newest first. Used by --all and by the cwd fallback. */
 async function allTranscripts(): Promise<{ path: string; mtime: number }[]> {
   if (!existsSync(PROJECTS)) return [];
-  const { statSync } = require("node:fs");
   const out: { path: string; mtime: number }[] = [];
-  for await (const p of new Glob("*/*.jsonl").scan({ cwd: PROJECTS, absolute: true })) {
+  for (const p of await jsonlOneLevel(PROJECTS)) {
     try {
       out.push({ path: p, mtime: statSync(p).mtimeMs });
     } catch {
@@ -130,14 +130,25 @@ async function findTranscript(): Promise<{ path: string; how: Ctx["resolvedBy"] 
  */
 const TAIL_BYTES = 512 * 1024;
 
+/** The last TAIL_BYTES of a file, without pulling the whole thing into memory. */
+async function readTail(path: string, size: number): Promise<string> {
+  const fh = await open(path, "r");
+  try {
+    const buf = Buffer.allocUnsafe(TAIL_BYTES);
+    const { bytesRead } = await fh.read(buf, 0, TAIL_BYTES, size - TAIL_BYTES);
+    return buf.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await fh.close();
+  }
+}
+
 async function readContext(transcript: string, limitOverride?: number): Promise<Ctx> {
-  const file = Bun.file(transcript);
   let ctx: Ctx;
   try {
-    const size = file.size;
-    const tail = size <= TAIL_BYTES ? await file.text() : await file.slice(size - TAIL_BYTES, size).text();
+    const size = (await stat(transcript)).size;
+    const tail = size <= TAIL_BYTES ? await readFile(transcript, "utf8") : await readTail(transcript, size);
     ctx = scan(tail, transcript, limitOverride);
-    if (!ctx.ok && size > TAIL_BYTES) ctx = scan(await file.text(), transcript, limitOverride);
+    if (!ctx.ok && size > TAIL_BYTES) ctx = scan(await readFile(transcript, "utf8"), transcript, limitOverride);
   } catch (e) {
     return { ok: false, error: `unreadable transcript: ${(e as Error).message}` };
   }
@@ -232,7 +243,7 @@ function renderRow(style: Style, ctx: Ctx, opts: { showSession: boolean; ageMs?:
 
 async function main() {
   const { values } = parseArgs({
-    args: Bun.argv.slice(2),
+    args: process.argv.slice(2),
     options: {
       json: { type: "boolean", default: false },
       "no-color": { type: "boolean", default: false },

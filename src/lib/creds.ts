@@ -5,9 +5,29 @@
 //                 ~/.claude/.credentials.json  (Linux keeps it in the file).
 //   Codex       : ~/.codex/auth.json           (access token + JWT id_token).
 
-import { $ } from "bun";
+import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
+
+const run = promisify(execFile);
+
+/**
+ * Run a command for its stdout, or null if it fails. execFile (not exec) — the
+ * arguments are keychain service/account names, which must never reach a shell.
+ * A non-zero exit is an expected outcome here (no such item, no `security`
+ * binary on Linux), not an error worth throwing over.
+ */
+async function stdoutOf(cmd: string, args: string[]): Promise<string | null> {
+  try {
+    // dump-keychain can exceed node's 1MB default buffer on a full keychain.
+    const { stdout } = await run(cmd, args, { maxBuffer: 64 * 1024 * 1024 });
+    return stdout;
+  } catch {
+    return null;
+  }
+}
 
 const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
 const CLAUDE_CREDS_FILE = join(homedir(), ".claude", ".credentials.json");
@@ -37,12 +57,12 @@ export interface ClaudeCreds {
  * then fetch each candidate by (service, account) and keep the ones with tokens.
  */
 async function claudeKeychainItems(): Promise<{ service: string; account: string }[]> {
-  const res = await $`security dump-keychain`.quiet().nothrow();
-  if (res.exitCode !== 0) return [];
+  const dump = await stdoutOf("security", ["dump-keychain"]);
+  if (dump === null) return [];
 
   const items: { service: string; account: string }[] = [];
   // dump-keychain prints one attribute block per item, each starting with `keychain: "…"`.
-  for (const block of res.stdout.toString().split(/^keychain: /m)) {
+  for (const block of dump.split(/^keychain: /m)) {
     const service = block.match(/"svce"<blob>="([^"]*)"/)?.[1];
     if (!service?.startsWith(CLAUDE_KEYCHAIN_SERVICE)) continue;
     items.push({ service, account: block.match(/"acct"<blob>="([^"]*)"/)?.[1] ?? "" });
@@ -60,12 +80,16 @@ export async function loadClaudeCreds(): Promise<ClaudeCreds | null> {
 
     const found: ClaudeCreds[] = [];
     for (const { service, account } of items) {
-      const res = account
-        ? await $`security find-generic-password -s ${service} -a ${account} -w`.quiet().nothrow()
-        : await $`security find-generic-password -s ${service} -w`.quiet().nothrow();
-      if (res.exitCode !== 0) continue;
+      const out = await stdoutOf("security", [
+        "find-generic-password",
+        "-s",
+        service,
+        ...(account ? ["-a", account] : []),
+        "-w",
+      ]);
+      if (out === null) continue;
       try {
-        const oauth = JSON.parse(res.stdout.toString()).claudeAiOauth;
+        const oauth = JSON.parse(out).claudeAiOauth;
         if (!oauth?.accessToken) continue; // stub entry — empty token
         found.push({
           token: oauth.accessToken,
@@ -88,17 +112,14 @@ export async function loadClaudeCreds(): Promise<ClaudeCreds | null> {
 
   // 2. ~/.claude/.credentials.json (the canonical store on Linux).
   try {
-    const f = Bun.file(CLAUDE_CREDS_FILE);
-    if (await f.exists()) {
-      const oauth = (await f.json()).claudeAiOauth;
-      if (oauth?.accessToken) {
-        return {
-          token: oauth.accessToken,
-          expiresAt: oauth.expiresAt,
-          subscriptionType: oauth.subscriptionType,
-          source: "file",
-        };
-      }
+    const oauth = JSON.parse(await readFile(CLAUDE_CREDS_FILE, "utf8")).claudeAiOauth;
+    if (oauth?.accessToken) {
+      return {
+        token: oauth.accessToken,
+        expiresAt: oauth.expiresAt,
+        subscriptionType: oauth.subscriptionType,
+        source: "file",
+      };
     }
   } catch {
     // unreadable / malformed
@@ -130,9 +151,7 @@ function decodeJwt(token: string): any {
  */
 export async function loadCodexCreds(): Promise<CodexCreds | null> {
   try {
-    const f = Bun.file(CODEX_AUTH_FILE);
-    if (!(await f.exists())) return null;
-    const auth = await f.json();
+    const auth = JSON.parse(await readFile(CODEX_AUTH_FILE, "utf8"));
     const accessToken = auth?.tokens?.access_token;
     if (!accessToken) return null;
     const claims = auth?.tokens?.id_token ? decodeJwt(auth.tokens.id_token) : null;

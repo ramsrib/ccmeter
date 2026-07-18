@@ -1,24 +1,31 @@
 {
   "name": "ccmeter",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "type": "module",
-  "description": "Usage meters for Claude Code and Codex — ccmeter watches the subscription budget, ctxmeter watches the context window.",
+  "description": "Usage meters for Claude Code and Codex \u2014 ccmeter watches the subscription budget, ctxmeter watches the context window.",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ramsrib/ccmeter.git"
   },
   "bin": {
-    "ccmeter": "src/ccmeter.ts",
-    "ctxmeter": "src/ctxmeter.ts"
+    "ccmeter": "bin/ccmeter",
+    "ctxmeter": "bin/ctxmeter"
   },
   "scripts": {
-    "lint": "tsc --noEmit",
-    "ccmeter": "bun run src/ccmeter.ts",
-    "ctxmeter": "bun run src/ctxmeter.ts"
+    "lint": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "^5"
-  }
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ]
 }

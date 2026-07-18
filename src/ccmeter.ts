@@ -17,8 +17,9 @@ import { parseArgs } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Glob } from "bun";
-import { loadClaudeCreds } from "./lib/creds";
+import { readFile } from "node:fs/promises";
+import { loadClaudeCreds } from "./lib/creds.ts";
+import { jsonlRecursive } from "./lib/walk.ts";
 import {
   bar,
   colorEnabled,
@@ -30,7 +31,7 @@ import {
   severity,
   severityColor,
   type Style,
-} from "./lib/format";
+} from "./lib/format.ts";
 
 const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 // The endpoint hard-429s (or 401s) without a claude-code User-Agent. The exact
@@ -148,7 +149,7 @@ async function getCodexUsage(): Promise<CodexUsage> {
 
   // Newest rollout files first; the latest snapshot lives in the freshest one.
   const files: { path: string; mtime: number }[] = [];
-  for await (const p of new Glob("**/*.jsonl").scan({ cwd: base, absolute: true })) {
+  for (const p of await jsonlRecursive(base)) {
     try {
       files.push({ path: p, mtime: statSync(p).mtimeMs });
     } catch {
@@ -160,7 +161,7 @@ async function getCodexUsage(): Promise<CodexUsage> {
   for (const { path, mtime } of files.slice(0, 25)) {
     let text: string;
     try {
-      text = await Bun.file(path).text();
+      text = await readFile(path, "utf8");
     } catch {
       continue;
     }
@@ -302,7 +303,7 @@ Codex numbers are the latest snapshot from ~/.codex rollout logs
 
 async function main() {
   const { values } = parseArgs({
-    args: Bun.argv.slice(2),
+    args: process.argv.slice(2),
     options: {
       json: { type: "boolean", default: false },
       "no-color": { type: "boolean", default: false },

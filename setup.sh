@@ -11,14 +11,16 @@ BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 TOOLS=(ccmeter ctxmeter)
 
 if command -v bun >/dev/null 2>&1; then
-  echo "  ✓ bun $(bun --version)"
+  echo "  ✓ bun $(bun --version) (preferred runtime)"
+elif command -v node >/dev/null 2>&1; then
+  echo "  ✓ node $(node --version) — bun not found, will use node"
 else
-  echo "  ! bun not on PATH — install from https://bun.sh (nothing runs without it)" >&2
+  echo "  ! neither bun nor node on PATH — nothing will run" >&2
 fi
 
 mkdir -p "$BIN_DIR"
 for name in "${TOOLS[@]}"; do
-  src="$REPO_DIR/src/$name.ts"
+  src="$REPO_DIR/bin/$name"
   chmod +x "$src"
   ln -sf "$src" "$BIN_DIR/$name"
   echo "  ↻ linked $BIN_DIR/$name -> $src"

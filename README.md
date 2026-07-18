@@ -24,9 +24,11 @@ $ ctxmeter
 
 ## Install
 
-Needs [bun](https://bun.sh) on `$PATH` — nothing else. Both tools are plain
-TypeScript run through their shebang; there is no build step and no
-`node_modules` at runtime.
+```sh
+brew install ramsrib/tap/ccmeter
+```
+
+Or from source:
 
 ```sh
 git clone https://github.com/ramsrib/ccmeter.git
@@ -34,6 +36,12 @@ cd ccmeter && ./setup.sh          # symlinks both tools into ~/.local/bin
 ```
 
 Set `BIN_DIR=/somewhere/else ./setup.sh` to link them elsewhere.
+
+Runs on **node ≥ 22.18** or **[bun](https://bun.sh)**, preferring bun when both
+are present (13ms startup vs 39ms). There is no build step and no dependencies —
+the tools are TypeScript executed directly, by bun natively or by node's type
+stripping. That means the source must stay erasable-only: no `enum`, no
+`namespace`, no constructor parameter properties, or node will refuse to run it.
 
 ## ccmeter — subscription usage
 
@@ -99,12 +107,15 @@ so a guard that cannot read usage fails closed rather than reading as idle.
 ## Layout
 
 ```
+bin/ccmeter        sh shim: exec bun (preferred) or node against src/
+bin/ctxmeter
 src/
   lib/creds.ts     locate Claude / Codex credentials (keychain, ~/.claude, ~/.codex)
   lib/format.ts    color, utilization bars, percent / reset-time / money formatting
+  lib/walk.ts      recursive *.jsonl search (no bun Glob, so node works too)
   ccmeter.ts       subscription usage
   ctxmeter.ts      context-window usage
-setup.sh           symlinks both into $BIN_DIR (default ~/.local/bin)
+setup.sh           symlinks both shims into $BIN_DIR (default ~/.local/bin)
 ```
 
 ## Caveats
