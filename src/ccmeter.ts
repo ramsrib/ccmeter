@@ -21,6 +21,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { claudeRouteFromEnv, loadClaudeCreds, routeAuth, type ClaudeRoute } from "./lib/creds.ts";
+import { appendHistory } from "./lib/history.ts";
 import { jsonlRecursive } from "./lib/walk.ts";
 import {
   bar,
@@ -304,49 +305,62 @@ async function getCodexUsage(): Promise<CodexUsage> {
   }
   files.sort((a, b) => b.mtime - a.mtime);
 
-  for (const { path, mtime } of files.slice(0, 25)) {
+  // The newest snapshot, by the snapshot's own timestamp. File mtime only
+  // bounds the search: rollouts get touched long after their last turn (a
+  // resumed session, the tab-title archiver moving its neighbours out), and
+  // trusting mtime once showed a two-day-old reading as "snapshot just now".
+  // A snapshot can't be newer than the file holding it, so once the files
+  // left are older than the best snapshot found, none of them can beat it.
+  let best: { rl: any; at: number } | null = null;
+  for (const { path, mtime } of files.slice(0, 200)) {
+    if (best && mtime < best.at) break;
     let text: string;
     try {
       text = await readFile(path, "utf8");
     } catch {
       continue;
     }
-    let last: any = null;
     for (const line of text.split("\n")) {
       if (!line.includes('"rate_limits"')) continue;
       try {
-        const rl = findRateLimits(JSON.parse(line));
-        if (rl) last = rl; // keep the last (most recent turn in this file)
+        const rec = JSON.parse(line);
+        const rl = findRateLimits(rec);
+        // Model-scoped limits (limit_id "codex_bengalfox", the Spark cap) ride
+        // in the same field; only the account-wide one is the plan's budget.
+        if (!rl || (rl.limit_id && rl.limit_id !== "codex")) continue;
+        const at = Date.parse(rec.timestamp);
+        if (Number.isFinite(at) && (!best || at > best.at)) best = { rl, at };
       } catch {
         // partial / non-JSON line
       }
     }
-    if (last) {
-      const win = (w: any): UsageWindow | undefined =>
-        w ? { pct: w.used_percent ?? 0, resetsAt: w.resets_at ? w.resets_at * 1000 : null } : undefined;
+  }
+  if (best) {
+    const last = best.rl;
+    const win = (w: any): UsageWindow | undefined =>
+      w ? { pct: w.used_percent ?? 0, resetsAt: w.resets_at ? w.resets_at * 1000 : null } : undefined;
 
-      // Bucket by window_minutes, NOT by position. `primary`/`secondary` are just
-      // slots, and Codex changes what it puts in them. On 2026-07-12 ~11:20 local,
-      // OpenAI *temporarily* dropped the 5h limit for Plus/Pro/Business (and reset
-      // usage); the server stopped sending that window mid-session — no client
-      // update involved. So the shape went from primary=300m + secondary=10080m to
-      // a lone primary=10080m with secondary=null.
-      //
-      // Read positionally, that rendered the WEEKLY figure in the 5h row — a 5-hour
-      // window "resetting in 6d", which is the tell — and left weekly blank.
-      // Classifying by each window's own duration is correct for both shapes, and
-      // means the 5h row simply reappears by itself when OpenAI restores the cap.
-      let fiveHour: UsageWindow | undefined;
-      let weekly: UsageWindow | undefined;
-      for (const w of [last.primary, last.secondary]) {
-        if (!w) continue;
-        const mins = w.window_minutes ?? 0;
-        if (mins <= 24 * 60) fiveHour = win(w);
-        else weekly = win(w);
-      }
-
-      return { ok: true, plan: last.plan_type, capturedAt: mtime, fiveHour, weekly };
+    // Bucket by window_minutes, NOT by position. `primary`/`secondary` are just
+    // slots, and Codex changes what it puts in them. On 2026-07-12 ~11:20 local,
+    // OpenAI *temporarily* dropped the 5h limit for Plus/Pro/Business (and reset
+    // usage); the server stopped sending that window mid-session — no client
+    // update involved. So the shape went from primary=300m + secondary=10080m to
+    // a lone primary=10080m with secondary=null.
+    //
+    // Read positionally, that rendered the WEEKLY figure in the 5h row — a 5-hour
+    // window "resetting in 6d", which is the tell — and left weekly blank.
+    // Classifying by each window's own duration is correct for both shapes, and
+    // means the 5h row simply reappears by itself when OpenAI restores the cap.
+    let fiveHour: UsageWindow | undefined;
+    let weekly: UsageWindow | undefined;
+    for (const w of [last.primary, last.secondary]) {
+      if (!w) continue;
+      const mins = w.window_minutes ?? 0;
+      if (mins <= 24 * 60) fiveHour = win(w);
+      else weekly = win(w);
     }
+
+    return { ok: true, plan: last.plan_type, capturedAt: best.at, fiveHour, weekly };
   }
   return { ok: false, error: "no rate-limit snapshot yet — run codex once" };
 }
@@ -452,6 +466,10 @@ Claude numbers are a live read of the OAuth usage endpoint. When
 ANTHROPIC_BASE_URL routes Claude Code through a gateway, they come from
 the rate-limit headers on a one-token probe sent through that gateway
 (CCMETER_PROBE_MODEL picks the model).
+
+Each run appends its readings to ~/.local/state/ccmeter/history.jsonl
+(CCMETER_HISTORY moves it, CCMETER_NO_HISTORY=1 turns it off); ccburn
+reads it to show how the windows moved.
 Codex numbers are the latest snapshot from ~/.codex rollout logs
 (as fresh as your last Codex turn).`;
 
@@ -473,6 +491,13 @@ async function main() {
   }
 
   const [claude, codex] = await Promise.all([getClaudeUsage(values.direct), getCodexUsage()]);
+  await appendHistory({
+    at: Date.now(),
+    claude: claude.ok
+      ? { route: claude.route, plan: claude.plan, fiveHour: claude.fiveHour, weekly: claude.weekly, scoped: claude.scoped }
+      : undefined,
+    codex: codex.ok ? { capturedAt: codex.capturedAt, fiveHour: codex.fiveHour, weekly: codex.weekly } : undefined,
+  });
 
   if (values.json) {
     console.log(JSON.stringify({ claude, codex, generatedAt: new Date().toISOString() }, null, 2));
