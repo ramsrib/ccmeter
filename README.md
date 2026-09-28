@@ -1,12 +1,14 @@
 # ccmeter
 
-Two small meters for people who live in **Claude Code** and **Codex**:
+Three small tools for people who live in **Claude Code** and **Codex**:
 
 - **`ccmeter`** — how much of your *subscription* is left (5h window, weekly, credit spend).
 - **`ctxmeter`** — how full the *current session's context window* is, and thus how close
   it is to an auto-compact.
+- **`ccburn`** — where the subscription *went*: which projects, sessions, models and
+  callers spent it, and when.
 
-Different budgets, same question: *do I have room to start this?*
+The meters answer *do I have room to start this?*; ccburn answers *what ate it?*
 
 **`ccmeter`** — what's left of the subscription, per window:
 
@@ -28,6 +30,22 @@ $ ctxmeter
   9b6977e9 dotfiles          23%  ██░░░░░░░░  232k / 1000k · just now
 ```
 
+**`ccburn`** — what spent it:
+
+```
+$ ccburn --codex
+Codex  · since 09/26, 09:58 (weekly window) · weekly 0→91%, +91% attributed · 3402 calls
+  by project
+     37%    +33%  acme/api                                   99 sessions
+     33%    +30%  acme/runtime                               50 sessions
+      5%   +4.6%  dotfiles                                   8 sessions
+  top sessions
+     +4.2%  09/27, 05:20–07:38  gpt-6-astra  acme/api                       codex exec
+            "Independent review of PR #262 at HEAD 65425224. Read-only…"
+  steepest hours
+    09/28, 12:00   +8.0%  weekly 81→89%
+```
+
 ## Install
 
 ```sh
@@ -38,7 +56,7 @@ Or from source:
 
 ```sh
 git clone https://github.com/ramsrib/ccmeter.git
-cd ccmeter && ./setup.sh          # symlinks both tools into ~/.local/bin
+cd ccmeter && ./setup.sh          # symlinks the tools into ~/.local/bin
 ```
 
 Set `BIN_DIR=/somewhere/else ./setup.sh` to link them elsewhere.
@@ -87,6 +105,13 @@ ccmeter --no-color
   (`~/.codex/sessions/**.jsonl`) — the same numbers the TUI `/status` shows.
   Free (no API call), but only as fresh as your last Codex turn.
 
+Every run appends its readings to `~/.local/state/ccmeter/history.jsonl`
+(`$XDG_STATE_HOME` is honoured; `CCMETER_HISTORY` moves the file,
+`CCMETER_NO_HISTORY=1` turns it off). Claude Code records tokens but never the
+window percentages, so this is the only record of how they moved; `ccburn`
+lines it up against the transcripts. The file trims itself to the last 35 days
+past 8MB.
+
 Exit status is non-zero only if *both* providers fail, which makes it safe to
 use as a gate in scripts.
 
@@ -131,18 +156,54 @@ as plain `claude-opus-4-8`), so it is inferred from the configured model's
 Exit status: `0` normal, `1` at/above `--threshold`, `2` usage indeterminate —
 so a guard that cannot read usage fails closed rather than reading as idle.
 
+## ccburn — where the usage went
+
+```sh
+ccburn                       # since each provider's weekly window started
+ccburn --since 6h            # or 2d, 1w, an ISO date
+ccburn --by model            # group by project (default), model or caller
+ccburn --timeline            # every hour, not just the five steepest
+ccburn --codex --json        # one provider, machine-readable
+```
+
+For each provider: spend grouped by project (worktrees and temp-dir review
+checkouts folded into their repo), the top sessions with the first thing they
+were asked, and the steepest hours.
+
+- **Codex** rollouts record each turn's tokens next to the account-wide weekly
+  percentage, so Codex spend is reported in real *weekly-window points*. Each
+  rise is split across the turns since the previous rise, weighted by tokens
+  (cached input at a tenth, output at four times fresh input). Codex reports
+  whole points, which is why a rise is spread back to the last one rather than
+  pinned on whatever ran just before the tick.
+- **Claude** transcripts carry tokens but no percentages, so Claude spend is
+  priced at Anthropic's API rates: an estimate of each share, not the
+  subscription's own accounting. A session's subagents roll into its row. With
+  `ccmeter` history on disk, each hour also shows what the 5h and weekly windows
+  read, and the default window starts at the weekly reset; without it, the last
+  7 days.
+- Sessions that run a GPT model through a gateway (Claude Code with
+  `--model gpt-…` behind a proxy) log to Claude transcripts but spend Codex
+  quota, so they count under Codex.
+
+Only this machine's logs are read: usage from other machines, or from the
+Codex and Claude apps, shows up in Codex's percentage but not in its sessions.
+
 ## Layout
 
 ```
 bin/ccmeter        sh shim: exec bun (preferred) or node against src/
 bin/ctxmeter
+bin/ccburn
 src/
   lib/creds.ts     locate Claude / Codex credentials (keychain, ~/.claude, ~/.codex)
   lib/format.ts    color, utilization bars, percent / reset-time / money formatting
+  lib/history.ts   the readings log ccmeter appends and ccburn reads
   lib/walk.ts      recursive *.jsonl search (no bun Glob, so node works too)
   ccmeter.ts       subscription usage
   ctxmeter.ts      context-window usage
-setup.sh           symlinks both shims into $BIN_DIR (default ~/.local/bin)
+  ccburn.ts        where the usage went
+setup.sh           symlinks the shims into $BIN_DIR (default ~/.local/bin)
 ```
 
 ## Caveats

@@ -8,7 +8,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-TOOLS=(ccmeter ctxmeter)
+TOOLS=(ccmeter ctxmeter ccburn)
 
 if command -v bun >/dev/null 2>&1; then
   echo "  ✓ bun $(bun --version) (preferred runtime)"
