@@ -128,6 +128,45 @@ export async function loadClaudeCreds(): Promise<ClaudeCreds | null> {
   return null;
 }
 
+const ANTHROPIC_DEFAULT_BASE = "https://api.anthropic.com";
+
+/**
+ * Where Claude Code in this environment sends its requests, and with what, read
+ * from the same variables Claude Code reads. An agent's Bash tool inherits them,
+ * so ccmeter run inside a gateway-routed session (ANTHROPIC_BASE_URL pointing at
+ * a proxy) meters that route instead of whatever `claude login` left in the
+ * Keychain, which may be a different account entirely.
+ *
+ *   ANTHROPIC_AUTH_TOKEN     `Authorization: Bearer`, the gateway variable
+ *   ANTHROPIC_API_KEY        `x-api-key`
+ *   CLAUDE_CODE_OAUTH_TOKEN  a subscription token, as from `claude setup-token`
+ *
+ * Returns null when none of them is set: the route is the Keychain login.
+ */
+export interface ClaudeRoute {
+  baseUrl: string;
+  isDefaultBase: boolean;
+  auth:
+    | { kind: "bearer"; token: string }
+    | { kind: "api-key"; key: string }
+    | { kind: "oauth"; token: string }
+    | { kind: "login" }; // no credential in env: the Keychain / ~/.claude login
+}
+
+export function claudeRouteFromEnv(env: NodeJS.ProcessEnv = process.env): ClaudeRoute | null {
+  const baseUrl = (env.ANTHROPIC_BASE_URL?.trim() || ANTHROPIC_DEFAULT_BASE).replace(/\/+$/, "");
+  const isDefaultBase = baseUrl === ANTHROPIC_DEFAULT_BASE;
+  const auth: ClaudeRoute["auth"] = env.ANTHROPIC_AUTH_TOKEN
+    ? { kind: "bearer", token: env.ANTHROPIC_AUTH_TOKEN }
+    : env.ANTHROPIC_API_KEY
+      ? { kind: "api-key", key: env.ANTHROPIC_API_KEY }
+      : env.CLAUDE_CODE_OAUTH_TOKEN
+        ? { kind: "oauth", token: env.CLAUDE_CODE_OAUTH_TOKEN }
+        : { kind: "login" };
+  if (isDefaultBase && auth.kind === "login") return null;
+  return { baseUrl, isDefaultBase, auth };
+}
+
 export interface CodexCreds {
   accessToken: string;
   accountId?: string;

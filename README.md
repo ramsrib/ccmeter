@@ -54,6 +54,7 @@ stripping. That means the source must stay erasable-only: no `enum`, no
 ```sh
 ccmeter              # colored summary
 ccmeter --json       # machine-readable (scripts, pre-flight quota checks)
+ccmeter --direct     # your claude.ai login, even inside a gateway-routed session
 ccmeter --no-color
 ```
 
@@ -61,6 +62,24 @@ ccmeter --no-color
   endpoint (`GET api.anthropic.com/api/oauth/usage`) using the Claude Code token
   from the macOS Keychain (falling back to `~/.claude/.credentials.json`). Shows
   the 5h and weekly utilization plus extra-usage credit spend when enabled.
+- **Claude behind a gateway** — when `ANTHROPIC_BASE_URL` points Claude Code at
+  a proxy, the Keychain login may not be the account that proxy spends, so
+  ccmeter meters the route instead. It reads the same variables Claude Code does
+  (`ANTHROPIC_BASE_URL`, then `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` or
+  `CLAUDE_CODE_OAUTH_TOKEN`), and an agent's Bash tool inherits them. A proxy
+  serves no usage endpoint, so ccmeter sends Claude Code's own quota probe (a
+  one-token `"quota"` message on `claude-haiku-4-5`, `CCMETER_PROBE_MODEL` to
+  change it) and reads the `anthropic-ratelimit-unified-*` headers Anthropic
+  puts on every subscription response. The header reads `via <host>` instead of
+  `live`, and `--json` adds a `route` field. The probe carries utilization but
+  not the plan name or credit amounts, so those don't appear.
+
+  It needs a gateway that forwards upstream response headers (CLIProxyAPI:
+  `passthrough-headers: true`); one that strips them gets a clear error, not
+  wrong numbers. A gateway that pools several accounts meters whichever one it
+  picks for the probe, which may not be the account a given session is pinned
+  to. Claude Code itself tracks no limits under a third-party token, so behind a
+  gateway ccmeter is the only view.
 - **Codex** — has no queryable usage API, so ccmeter reads the most recent
   rate-limit snapshot Codex writes to its rollout logs
   (`~/.codex/sessions/**.jsonl`) — the same numbers the TUI `/status` shows.

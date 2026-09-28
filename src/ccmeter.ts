@@ -6,19 +6,21 @@
  *            (GET api.anthropic.com/api/oauth/usage) using the Claude Code
  *            OAuth token from the Keychain / ~/.claude. Shows 5h + weekly
  *            utilization and, when enabled, extra-usage credit spend.
+ *            When ANTHROPIC_BASE_URL routes Claude Code through a gateway, it
+ *            meters that route instead (see getGatewayUsage).
  *   Codex  : the most recent rate-limit snapshot Codex persists to its rollout
  *            logs (~/.codex/sessions/**.jsonl) — the same numbers the TUI
  *            `/status` shows. Free (no API call), but only as fresh as your
  *            last Codex turn.
  *
- * Flags:  --json   machine-readable output  |  --no-color  |  -h/--help
+ * Flags:  --json   machine-readable output  |  --direct  |  --no-color  |  -h/--help
  */
 import { parseArgs } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
-import { loadClaudeCreds } from "./lib/creds.ts";
+import { claudeRouteFromEnv, loadClaudeCreds, type ClaudeRoute } from "./lib/creds.ts";
 import { jsonlRecursive } from "./lib/walk.ts";
 import {
   bar,
@@ -38,6 +40,10 @@ const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 // version isn't significant — only the shape — so a constant avoids spawning
 // `claude --version` on every run. Bump if Anthropic ever tightens this.
 const CLAUDE_UA = "claude-code/2.1.201";
+// Model for the gateway quota probe: the cheapest one every Claude account
+// serves. The reply is one token and is thrown away.
+const PROBE_MODEL = process.env.CCMETER_PROBE_MODEL || "claude-haiku-4-5-20251001";
+const PROBE_TIMEOUT_MS = 15_000;
 
 interface UsageWindow {
   pct: number;
@@ -48,6 +54,8 @@ interface ClaudeUsage {
   ok: boolean;
   error?: string;
   plan?: string;
+  // Present when the numbers came from ANTHROPIC_* rather than the Keychain login.
+  route?: { baseUrl: string; auth: ClaudeRoute["auth"]["kind"] };
   fiveHour?: UsageWindow;
   weekly?: UsageWindow;
   // Per-model / per-surface caps (e.g. Fable) that draw down a parent window
@@ -56,7 +64,9 @@ interface ClaudeUsage {
   // array is the source of truth `/usage` renders from; the legacy top-level
   // fields don't expose these.
   scoped?: { label: string; group: string; window: UsageWindow }[];
-  credits?: { pct: number; used: number; limit: number; currency: string };
+  // used/limit/currency come only from the usage endpoint; a gateway probe's
+  // headers carry the utilization alone.
+  credits?: { pct: number; used?: number; limit?: number; currency?: string };
 }
 
 interface CodexUsage {
@@ -70,30 +80,61 @@ interface CodexUsage {
 
 // ---------------------------------------------------------------- Claude (live)
 
-async function getClaudeUsage(): Promise<ClaudeUsage> {
+/**
+ * Meter the route Claude Code in this environment actually uses. With no
+ * ANTHROPIC_* overrides (or with --direct) that's the Keychain login. Otherwise
+ * it's whatever the env names, which is the account an agent in a gateway-routed
+ * session is spending, not necessarily the one `claude login` holds.
+ */
+async function getClaudeUsage(direct: boolean): Promise<ClaudeUsage> {
+  const route = direct ? null : claudeRouteFromEnv();
+
+  if (route && !route.isDefaultBase) {
+    let token: string | undefined;
+    if (route.auth.kind === "login") {
+      // A gateway in front of the login: Claude Code forwards the OAuth token.
+      const creds = await loadClaudeCreds();
+      if (!creds) return { ok: false, error: "not logged in — run: claude login" };
+      token = creds.token;
+    }
+    return getGatewayUsage(route, token);
+  }
+  if (route?.auth.kind === "oauth") return getOAuthUsage(route.auth.token, undefined, route);
+  if (route)
+    // An API key straight to Anthropic: pay-as-you-go, there are no windows.
+    return {
+      ok: false,
+      error: `${route.auth.kind === "api-key" ? "ANTHROPIC_API_KEY" : "ANTHROPIC_AUTH_TOKEN"} is set: API billing, no subscription windows (--direct for your login)`,
+      route: { baseUrl: route.baseUrl, auth: route.auth.kind },
+    };
+
   const creds = await loadClaudeCreds();
   if (!creds) return { ok: false, error: "not logged in — run: claude login" };
+  return getOAuthUsage(creds.token, creds.subscriptionType);
+}
 
+async function getOAuthUsage(token: string, plan: string | undefined, route?: ClaudeRoute): Promise<ClaudeUsage> {
   let res: Response;
   try {
     res = await fetch(CLAUDE_USAGE_URL, {
       headers: {
-        Authorization: `Bearer ${creds.token}`,
+        Authorization: `Bearer ${token}`,
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": CLAUDE_UA,
         "Content-Type": "application/json",
       },
     });
   } catch (e) {
-    return { ok: false, error: `request failed: ${(e as Error).message}`, plan: creds.subscriptionType };
+    return { ok: false, error: `request failed: ${(e as Error).message}`, plan: plan };
   }
 
   if (res.status === 401)
-    return { ok: false, error: "token expired — run: claude login", plan: creds.subscriptionType };
-  if (!res.ok) return { ok: false, error: `HTTP ${res.status}`, plan: creds.subscriptionType };
+    return { ok: false, error: "token expired — run: claude login", plan: plan };
+  if (!res.ok) return { ok: false, error: `HTTP ${res.status}`, plan: plan };
 
   const d = (await res.json()) as any;
-  const out: ClaudeUsage = { ok: true, plan: creds.subscriptionType };
+  const out: ClaudeUsage = { ok: true, plan: plan };
+  if (route) out.route = { baseUrl: route.baseUrl, auth: route.auth.kind };
   if (d.five_hour)
     out.fiveHour = { pct: d.five_hour.utilization ?? 0, resetsAt: d.five_hour.resets_at ?? null };
   if (d.seven_day)
@@ -126,6 +167,89 @@ async function getClaudeUsage(): Promise<ClaudeUsage> {
       currency: eu.currency ?? "USD",
     };
   }
+  return out;
+}
+
+// ------------------------------------------------------------ Claude (gateway)
+
+// The unified windows, keyed by the name they carry in response headers. This is
+// the table Claude Code parses the same headers with; 7d_oi is the one its UI
+// calls the Fable limit, which draws from the weekly window.
+const UNIFIED_WINDOWS = ["5h", "7d", "7d_oi", "overage"] as const;
+
+function unifiedWindow(h: Headers, key: string): UsageWindow | undefined {
+  const num = (v: string | null) => (v === null || v === "" ? undefined : Number(v));
+  const util = num(h.get(`anthropic-ratelimit-unified-${key}-utilization`));
+  if (util === undefined || !Number.isFinite(util)) return undefined;
+  const reset = num(h.get(`anthropic-ratelimit-unified-${key}-reset`)); // epoch s
+  return {
+    pct: Math.round(util * 1000) / 10, // a 0-1 fraction here, a percent from /usage
+    resetsAt: reset !== undefined && Number.isFinite(reset) ? reset * 1000 : null,
+  };
+}
+
+/**
+ * Behind a gateway there's no usage endpoint to read (the proxy answers
+ * /v1/messages, not /api/oauth/usage), and Claude Code itself stops tracking
+ * limits once auth is a third-party token. What does still flow is the
+ * subscription's own accounting: Anthropic attaches anthropic-ratelimit-unified-*
+ * headers to every subscription response, 429s included. So send the probe
+ * Claude Code sends for its quota check (a one-token "quota" message) through
+ * the same route and read the headers off the reply.
+ *
+ * That meters whichever account the gateway picks for the probe. A gateway that
+ * pins one account per session could pick a different one for this request than
+ * for the agent asking. Headers only arrive if the gateway forwards upstream
+ * response headers at all.
+ */
+async function getGatewayUsage(route: ClaudeRoute, loginToken?: string): Promise<ClaudeUsage> {
+  const routeInfo = { baseUrl: route.baseUrl, auth: route.auth.kind };
+  const host = new URL(route.baseUrl).host;
+  const auth: Record<string, string> =
+    route.auth.kind === "bearer"
+      ? { Authorization: `Bearer ${route.auth.token}` }
+      : route.auth.kind === "api-key"
+        ? { "x-api-key": route.auth.key }
+        : {
+            Authorization: `Bearer ${route.auth.kind === "oauth" ? route.auth.token : loginToken}`,
+            "anthropic-beta": "oauth-2025-04-20",
+          };
+
+  let res: Response;
+  try {
+    res = await fetch(`${route.baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        ...auth,
+        "anthropic-version": "2023-06-01",
+        "User-Agent": CLAUDE_UA,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: PROBE_MODEL,
+        max_tokens: 1,
+        messages: [{ role: "user", content: "quota" }],
+      }),
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    await res.body?.cancel();
+  } catch (e) {
+    return { ok: false, error: `${host}: request failed: ${(e as Error).message}`, route: routeInfo };
+  }
+
+  const h = res.headers;
+  const [fiveHour, weekly, fable, overage] = UNIFIED_WINDOWS.map((k) => unifiedWindow(h, k));
+  if (!fiveHour && !weekly) {
+    const why = res.ok
+      ? "sent no rate-limit headers (the gateway isn't forwarding them)"
+      : `answered HTTP ${res.status}`;
+    return { ok: false, error: `${host} ${why} — --direct for your login`, route: routeInfo };
+  }
+
+  const out: ClaudeUsage = { ok: true, fiveHour, weekly, route: routeInfo };
+  if (fable) out.scoped = [{ label: "Fable", group: "weekly", window: { ...fable, resetsAt: null } }];
+  if (overage && !h.get("anthropic-ratelimit-unified-overage-disabled-reason"))
+    out.credits = { pct: overage.pct };
   return out;
 }
 
@@ -253,7 +377,7 @@ function providerHeader(style: Style, name: string, plan: string | undefined, ri
 function renderClaude(style: Style, u: ClaudeUsage): string[] {
   if (!u.ok)
     return [providerHeader(style, "Claude", u.plan, ""), `  ${style.red(u.error ?? "unavailable")}`];
-  const lines = [providerHeader(style, "Claude", u.plan, "live")];
+  const lines = [providerHeader(style, "Claude", u.plan, u.route ? `via ${new URL(u.route.baseUrl).host}` : "live")];
   // `group` is the API's name for the parent window; the label is what we print.
   const rendered = new Set(["session", "weekly"]);
   lines.push(...groupRows(style, "5h", "session", u.fiveHour, u.scoped));
@@ -267,7 +391,9 @@ function renderClaude(style: Style, u: ClaudeUsage): string[] {
         style,
         "credits",
         { pct: u.credits.pct, resetsAt: null },
-        `${money(u.credits.used, u.credits.currency)} / ${money(u.credits.limit, u.credits.currency)}`,
+        u.credits.used !== undefined && u.credits.limit !== undefined
+          ? `${money(u.credits.used, u.credits.currency ?? "USD")} / ${money(u.credits.limit, u.credits.currency ?? "USD")}`
+          : undefined,
       ),
     );
   return lines;
@@ -291,13 +417,17 @@ function renderCodex(style: Style, u: CodexUsage): string[] {
 
 const HELP = `ccmeter — subscription usage for Claude and Codex
 
-usage: ccmeter [--json] [--no-color]
+usage: ccmeter [--json] [--direct] [--no-color]
 
   --json       machine-readable JSON (for scripts / pre-flight quota checks)
+  --direct     meter your claude.ai login, ignoring ANTHROPIC_* overrides
   --no-color   disable ANSI color
   -h, --help   show this help
 
-Claude numbers are a live read of the OAuth usage endpoint.
+Claude numbers are a live read of the OAuth usage endpoint. When
+ANTHROPIC_BASE_URL routes Claude Code through a gateway, they come from
+the rate-limit headers on a one-token probe sent through that gateway
+(CCMETER_PROBE_MODEL picks the model).
 Codex numbers are the latest snapshot from ~/.codex rollout logs
 (as fresh as your last Codex turn).`;
 
@@ -306,6 +436,7 @@ async function main() {
     args: process.argv.slice(2),
     options: {
       json: { type: "boolean", default: false },
+      direct: { type: "boolean", default: false },
       "no-color": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -317,7 +448,7 @@ async function main() {
     return;
   }
 
-  const [claude, codex] = await Promise.all([getClaudeUsage(), getCodexUsage()]);
+  const [claude, codex] = await Promise.all([getClaudeUsage(values.direct), getCodexUsage()]);
 
   if (values.json) {
     console.log(JSON.stringify({ claude, codex, generatedAt: new Date().toISOString() }, null, 2));
