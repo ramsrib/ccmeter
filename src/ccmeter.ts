@@ -312,7 +312,7 @@ async function getCodexUsage(): Promise<CodexUsage> {
   // A snapshot can't be newer than the file holding it, so once the files
   // left are older than the best snapshot found, none of them can beat it.
   let best: { rl: any; at: number } | null = null;
-  for (const { path, mtime } of files.slice(0, 200)) {
+  for (const { path, mtime } of files) {
     if (best && mtime < best.at) break;
     let text: string;
     try {

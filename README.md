@@ -43,7 +43,7 @@ Codex  · since 09/26, 09:58 (weekly window) · weekly 0→91%, +91% attributed 
      +4.2%  09/27, 05:20–07:38  gpt-6-astra  acme/api                       codex exec
             "Independent review of PR #262 at HEAD 65425224. Read-only…"
   steepest hours
-    09/28, 12:00   +8.0%  weekly 81→89%
+    09/28, 12:00   +8.0%  read weekly 81→89%
 ```
 
 ## Install
@@ -176,6 +176,8 @@ were asked, and the steepest hours.
   (cached input at a tenth, output at four times fresh input). Codex reports
   whole points, which is why a rise is spread back to the last one rather than
   pinned on whatever ran just before the tick.
+  An hour's `+N%` is what its turns caused; the `read` note beside it is what
+  the snapshots taken in that hour said, which can lag the turns behind them.
 - **Claude** transcripts carry tokens but no percentages, so Claude spend is
   priced at Anthropic's API rates: an estimate of each share, not the
   subscription's own accounting. A session's subagents roll into its row. With

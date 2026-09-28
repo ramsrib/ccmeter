@@ -201,9 +201,14 @@ async function collectClaude(sinceMs: number, sessions: Map<string, SessionInfo>
       if (rec.type !== "assistant" || !u || !msg.model || msg.model === "<synthetic>") continue;
       const t = Date.parse(rec.timestamp);
       if (!(t >= sinceMs)) continue;
-      const id = msg.id ?? rec.uuid;
+      // One message is logged once per content block, all with the same usage.
+      // A per-line uuid would bill each block again, so fall back to the usage itself.
+      const id = msg.id ?? `${rec.timestamp}|${msg.model}|${JSON.stringify(u)}`;
       if (seen.has(id)) continue;
       seen.add(id);
+      // Older Claude Code wrote subagent turns inline; they're subagent spend
+      // wherever they're found, not whichever file the walk reached first.
+      const spendCaller = rec.isSidechain && !sub ? "subagent" : caller;
 
       const input = u.input_tokens ?? 0;
       const cacheRead = u.cache_read_input_tokens ?? 0;
@@ -214,7 +219,9 @@ async function collectClaude(sinceMs: number, sessions: Map<string, SessionInfo>
       const model: string = msg.model;
 
       if (!model.includes("claude")) {
-        // A GPT model behind a gateway: Codex quota, recorded here only.
+        // A GPT model behind a gateway spends Codex quota and is recorded only
+        // here. Anything else (Gemini, a local model) is neither provider's.
+        if (!/^(?:[a-z]+\/)?(gpt|o\d|codex)/i.test(model)) continue;
         out.push({
           t,
           provider: "codex",
@@ -237,7 +244,7 @@ async function collectClaude(sinceMs: number, sessions: Map<string, SessionInfo>
           cacheRead * pr.cacheRead +
           output * pr.output) /
         1e6;
-      out.push({ t, provider: "claude", session, caller, model: model.replace(/\[1m\]$/, ""), cost, points: 0, tokens });
+      out.push({ t, provider: "claude", session, caller: spendCaller, model: model.replace(/\[1m\]$/, ""), cost, points: 0, tokens });
     }
   }
   return out;
@@ -298,17 +305,23 @@ async function collectCodex(
         const tot = p.info?.total_token_usage;
         if (tot) {
           const cur = {
-            fresh: (tot.input_tokens ?? 0) - (tot.cached_input_tokens ?? 0),
+            fresh: Math.max(0, (tot.input_tokens ?? 0) - (tot.cached_input_tokens ?? 0)),
             cached: tot.cached_input_tokens ?? 0,
             output: tot.output_tokens ?? 0,
           };
-          const d = prev
-            ? {
-                fresh: Math.max(0, cur.fresh - prev.fresh),
-                cached: Math.max(0, cur.cached - prev.cached),
-                output: Math.max(0, cur.output - prev.output),
-              }
-            : cur;
+          // Differences of the running totals, not last_token_usage: Codex
+          // re-emits a token_count with an unchanged total (46 of 4140 events
+          // in one sample), and last_token_usage would bill those turns twice.
+          // A total that falls means the counter restarted; count it afresh.
+          const restarted = prev !== null && cur.fresh + cur.cached + cur.output < prev.fresh + prev.cached + prev.output;
+          const d =
+            prev && !restarted
+              ? {
+                  fresh: Math.max(0, cur.fresh - prev.fresh),
+                  cached: Math.max(0, cur.cached - prev.cached),
+                  output: Math.max(0, cur.output - prev.output),
+                }
+              : cur;
           prev = cur;
           if (t >= sinceMs && (d.fresh || d.cached || d.output))
             spends.push({
@@ -523,13 +536,13 @@ function build(
     const inHour = (t: number) => t >= Math.max(h.hour, since) && t < h.hour + 3600e3;
     if (provider === "codex") {
       const v = readings.filter((r) => inHour(r.t)).map((r) => r.pct);
-      if (v.length) h.readings = `weekly ${span(v)}`;
+      if (v.length) h.readings = `read weekly ${span(v)}`;
     } else {
       const es = history.filter((e) => e.claude && inHour(e.at));
       const five = es.map((e) => e.claude!.fiveHour?.pct).filter((x): x is number => x != null);
       const week = es.map((e) => e.claude!.weekly?.pct).filter((x): x is number => x != null);
       const parts = [five.length && `5h ${span(five)}`, week.length && `weekly ${span(week)}`].filter(Boolean);
-      if (parts.length) h.readings = parts.join(" · ");
+      if (parts.length) h.readings = `read ${parts.join(" · ")}`;
     }
   }
   if (provider === "codex") {
@@ -640,9 +653,13 @@ async function main() {
   resolveRepoProjects(sessions);
 
   // Each provider's weekly window, from its latest reset time.
+  // A reset time already past means the newest reading predates the reset:
+  // the current window began at that reset (or a whole week after it).
   const windowStart = (resetsAt: number | string | null | undefined) => {
-    const t = typeof resetsAt === "string" ? Date.parse(resetsAt) : resetsAt;
-    return t && Number.isFinite(t) && t > now ? t - WEEK_MS : null;
+    let t = typeof resetsAt === "string" ? Date.parse(resetsAt) : resetsAt;
+    if (!t || !Number.isFinite(t)) return null;
+    while (t <= now) t += WEEK_MS;
+    return t - WEEK_MS;
   };
   const codexReset = windowStart(codexData.readings.at(-1)?.resetsAt);
   const claudeReset = windowStart([...history].reverse().find((e) => e.claude?.weekly)?.claude?.weekly?.resetsAt);
