@@ -20,7 +20,7 @@ import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
-import { claudeRouteFromEnv, loadClaudeCreds, type ClaudeRoute } from "./lib/creds.ts";
+import { claudeRouteFromEnv, loadClaudeCreds, routeAuth, type ClaudeRoute } from "./lib/creds.ts";
 import { jsonlRecursive } from "./lib/walk.ts";
 import {
   bar,
@@ -55,7 +55,7 @@ interface ClaudeUsage {
   error?: string;
   plan?: string;
   // Present when the numbers came from ANTHROPIC_* rather than the Keychain login.
-  route?: { baseUrl: string; auth: ClaudeRoute["auth"]["kind"] };
+  route?: { baseUrl: string; auth: string };
   fiveHour?: UsageWindow;
   weekly?: UsageWindow;
   // Per-model / per-surface caps (e.g. Fable) that draw down a parent window
@@ -88,24 +88,28 @@ interface CodexUsage {
  */
 async function getClaudeUsage(direct: boolean): Promise<ClaudeUsage> {
   const route = direct ? null : claudeRouteFromEnv();
+  if (route && "error" in route) return { ok: false, error: route.error };
 
   if (route && !route.isDefaultBase) {
-    let token: string | undefined;
-    if (route.auth.kind === "login") {
+    let loginToken: string | undefined;
+    if (!route.authToken && !route.apiKey && !route.oauthToken) {
       // A gateway in front of the login: Claude Code forwards the OAuth token.
       const creds = await loadClaudeCreds();
       if (!creds) return { ok: false, error: "not logged in — run: claude login" };
-      token = creds.token;
+      loginToken = creds.token;
     }
-    return getGatewayUsage(route, token);
+    return getGatewayUsage(route, loginToken);
   }
-  if (route?.auth.kind === "oauth") return getOAuthUsage(route.auth.token, undefined, route);
+  if (route?.oauthToken)
+    // A `claude setup-token` token is inference-only, and the usage endpoint
+    // wants the user:profile scope on top. The probe needs only inference.
+    return getOAuthUsage(route.oauthToken, undefined, route, () => getGatewayUsage(route));
   if (route)
     // An API key straight to Anthropic: pay-as-you-go, there are no windows.
     return {
       ok: false,
-      error: `${route.auth.kind === "api-key" ? "ANTHROPIC_API_KEY" : "ANTHROPIC_AUTH_TOKEN"} is set: API billing, no subscription windows (--direct for your login)`,
-      route: { baseUrl: route.baseUrl, auth: route.auth.kind },
+      error: `${route.authToken ? "ANTHROPIC_AUTH_TOKEN" : "ANTHROPIC_API_KEY"} is set: API billing, no subscription windows (--direct for your login)`,
+      route: { baseUrl: route.baseUrl, auth: routeAuth(route) },
     };
 
   const creds = await loadClaudeCreds();
@@ -113,7 +117,12 @@ async function getClaudeUsage(direct: boolean): Promise<ClaudeUsage> {
   return getOAuthUsage(creds.token, creds.subscriptionType);
 }
 
-async function getOAuthUsage(token: string, plan: string | undefined, route?: ClaudeRoute): Promise<ClaudeUsage> {
+async function getOAuthUsage(
+  token: string,
+  plan: string | undefined,
+  route?: ClaudeRoute,
+  onUnauthorized?: () => Promise<ClaudeUsage>,
+): Promise<ClaudeUsage> {
   let res: Response;
   try {
     res = await fetch(CLAUDE_USAGE_URL, {
@@ -128,13 +137,14 @@ async function getOAuthUsage(token: string, plan: string | undefined, route?: Cl
     return { ok: false, error: `request failed: ${(e as Error).message}`, plan: plan };
   }
 
+  if (onUnauthorized && (res.status === 401 || res.status === 403)) return onUnauthorized();
   if (res.status === 401)
     return { ok: false, error: "token expired — run: claude login", plan: plan };
   if (!res.ok) return { ok: false, error: `HTTP ${res.status}`, plan: plan };
 
   const d = (await res.json()) as any;
   const out: ClaudeUsage = { ok: true, plan: plan };
-  if (route) out.route = { baseUrl: route.baseUrl, auth: route.auth.kind };
+  if (route) out.route = { baseUrl: route.baseUrl, auth: routeAuth(route) };
   if (d.five_hour)
     out.fiveHour = { pct: d.five_hour.utilization ?? 0, resetsAt: d.five_hour.resets_at ?? null };
   if (d.seven_day)
@@ -183,7 +193,7 @@ function unifiedWindow(h: Headers, key: string): UsageWindow | undefined {
   if (util === undefined || !Number.isFinite(util)) return undefined;
   const reset = num(h.get(`anthropic-ratelimit-unified-${key}-reset`)); // epoch s
   return {
-    pct: Math.round(util * 1000) / 10, // a 0-1 fraction here, a percent from /usage
+    pct: util * 100, // a 0-1 fraction here, a percent from /usage; display rounds
     resetsAt: reset !== undefined && Number.isFinite(reset) ? reset * 1000 : null,
   };
 }
@@ -203,17 +213,15 @@ function unifiedWindow(h: Headers, key: string): UsageWindow | undefined {
  * response headers at all.
  */
 async function getGatewayUsage(route: ClaudeRoute, loginToken?: string): Promise<ClaudeUsage> {
-  const routeInfo = { baseUrl: route.baseUrl, auth: route.auth.kind };
+  const routeInfo = { baseUrl: route.baseUrl, auth: routeAuth(route) };
   const host = new URL(route.baseUrl).host;
-  const auth: Record<string, string> =
-    route.auth.kind === "bearer"
-      ? { Authorization: `Bearer ${route.auth.token}` }
-      : route.auth.kind === "api-key"
-        ? { "x-api-key": route.auth.key }
-        : {
-            Authorization: `Bearer ${route.auth.kind === "oauth" ? route.auth.token : loginToken}`,
-            "anthropic-beta": "oauth-2025-04-20",
-          };
+  const auth: Record<string, string> = {};
+  if (route.authToken) auth.Authorization = `Bearer ${route.authToken}`;
+  if (route.apiKey) auth["x-api-key"] = route.apiKey;
+  if (!route.authToken && !route.apiKey) {
+    auth.Authorization = `Bearer ${route.oauthToken ?? loginToken}`;
+    auth["anthropic-beta"] = "oauth-2025-04-20";
+  }
 
   let res: Response;
   try {
@@ -232,18 +240,22 @@ async function getGatewayUsage(route: ClaudeRoute, loginToken?: string): Promise
       }),
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
-    await res.body?.cancel();
   } catch (e) {
     return { ok: false, error: `${host}: request failed: ${(e as Error).message}`, route: routeInfo };
   }
+  // The headers are all we came for; a body that errors on the way out is no reason to lose them.
+  res.body?.cancel().catch(() => {});
 
   const h = res.headers;
   const [fiveHour, weekly, fable, overage] = UNIFIED_WINDOWS.map((k) => unifiedWindow(h, k));
   if (!fiveHour && !weekly) {
+    // Written to be pasted into an agent as-is: what was sent, what came back,
+    // and the causes that fit it.
     const why = res.ok
-      ? "sent no rate-limit headers (the gateway isn't forwarding them)"
-      : `answered HTTP ${res.status}`;
-    return { ok: false, error: `${host} ${why} — --direct for your login`, route: routeInfo };
+      ? `POST /v1/messages returned HTTP ${res.status} without anthropic-ratelimit-unified-* headers. ` +
+        "Either the gateway strips upstream response headers, or it isn't serving this model from a Claude subscription"
+      : `POST /v1/messages returned HTTP ${res.status} without anthropic-ratelimit-unified-* headers`;
+    return { ok: false, error: `${host}: ${why} (--direct meters your claude.ai login)`, route: routeInfo };
   }
 
   const out: ClaudeUsage = { ok: true, fiveHour, weekly, route: routeInfo };

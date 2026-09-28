@@ -138,33 +138,51 @@ const ANTHROPIC_DEFAULT_BASE = "https://api.anthropic.com";
  * Keychain, which may be a different account entirely.
  *
  *   ANTHROPIC_AUTH_TOKEN     `Authorization: Bearer`, the gateway variable
- *   ANTHROPIC_API_KEY        `x-api-key`
- *   CLAUDE_CODE_OAUTH_TOKEN  a subscription token, as from `claude setup-token`
+ *   ANTHROPIC_API_KEY        `x-api-key`; with the token set too, both are sent
+ *   CLAUDE_CODE_OAUTH_TOKEN  a subscription token (`claude setup-token`), used
+ *                            only when neither of the above is set
  *
- * Returns null when none of them is set: the route is the Keychain login.
+ * With none of them set the credential is the Keychain login, and the route is
+ * null unless ANTHROPIC_BASE_URL still points somewhere other than Anthropic.
  */
 export interface ClaudeRoute {
-  baseUrl: string;
+  baseUrl: string; // origin + path prefix, no trailing slash
   isDefaultBase: boolean;
-  auth:
-    | { kind: "bearer"; token: string }
-    | { kind: "api-key"; key: string }
-    | { kind: "oauth"; token: string }
-    | { kind: "login" }; // no credential in env: the Keychain / ~/.claude login
+  authToken?: string;
+  apiKey?: string;
+  oauthToken?: string;
 }
 
-export function claudeRouteFromEnv(env: NodeJS.ProcessEnv = process.env): ClaudeRoute | null {
-  const baseUrl = (env.ANTHROPIC_BASE_URL?.trim() || ANTHROPIC_DEFAULT_BASE).replace(/\/+$/, "");
-  const isDefaultBase = baseUrl === ANTHROPIC_DEFAULT_BASE;
-  const auth: ClaudeRoute["auth"] = env.ANTHROPIC_AUTH_TOKEN
-    ? { kind: "bearer", token: env.ANTHROPIC_AUTH_TOKEN }
-    : env.ANTHROPIC_API_KEY
-      ? { kind: "api-key", key: env.ANTHROPIC_API_KEY }
-      : env.CLAUDE_CODE_OAUTH_TOKEN
-        ? { kind: "oauth", token: env.CLAUDE_CODE_OAUTH_TOKEN }
-        : { kind: "login" };
-  if (isDefaultBase && auth.kind === "login") return null;
-  return { baseUrl, isDefaultBase, auth };
+export function claudeRouteFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): ClaudeRoute | { error: string } | null {
+  const raw = env.ANTHROPIC_BASE_URL?.trim() || ANTHROPIC_DEFAULT_BASE;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { error: `ANTHROPIC_BASE_URL is not a URL: ${raw}` };
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:")
+    return { error: `ANTHROPIC_BASE_URL is not an http(s) URL: ${raw}` };
+  // URL lowercases the host and drops a default port, so every spelling of
+  // api.anthropic.com compares equal.
+  const baseUrl = (url.origin + url.pathname).replace(/\/+$/, "");
+  const route: ClaudeRoute = {
+    baseUrl,
+    isDefaultBase: baseUrl === ANTHROPIC_DEFAULT_BASE,
+    authToken: env.ANTHROPIC_AUTH_TOKEN || undefined,
+    apiKey: env.ANTHROPIC_API_KEY || undefined,
+  };
+  if (!route.authToken && !route.apiKey) route.oauthToken = env.CLAUDE_CODE_OAUTH_TOKEN || undefined;
+  if (route.isDefaultBase && !route.authToken && !route.apiKey && !route.oauthToken) return null;
+  return route;
+}
+
+/** Which credential a route carries, for display and --json. */
+export function routeAuth(route: ClaudeRoute): string {
+  const sent = [route.authToken && "bearer", route.apiKey && "api-key"].filter(Boolean);
+  return sent.length ? sent.join("+") : route.oauthToken ? "oauth" : "login";
 }
 
 export interface CodexCreds {
