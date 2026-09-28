@@ -68,11 +68,13 @@ ccmeter --no-color
   (`ANTHROPIC_BASE_URL`, then `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` or
   `CLAUDE_CODE_OAUTH_TOKEN`), and an agent's Bash tool inherits them. A proxy
   serves no usage endpoint, so ccmeter sends Claude Code's own quota probe (a
-  one-token `"quota"` message on `claude-haiku-4-5`, `CCMETER_PROBE_MODEL` to
-  change it) and reads the `anthropic-ratelimit-unified-*` headers Anthropic
-  puts on every subscription response. The header reads `via <host>` instead of
-  `live`, and `--json` adds a `route` field. The probe carries utilization but
-  not the plan name or credit amounts, so those don't appear.
+  one-token `"quota"` message on `claude-haiku-4-5-20251001`,
+  `CCMETER_PROBE_MODEL` to change it) and reads the `anthropic-ratelimit-unified-*`
+  headers Anthropic puts on every subscription response. The header reads
+  `via <host>` instead of `live`, and `--json` adds a `route` field (also set
+  when the credential came from the environment but went to Anthropic
+  directly). The probe carries utilization but not the plan name or credit
+  amounts, so in `--json` a gateway's `credits` is `{ "pct": … }` alone.
 
   It needs a gateway that forwards upstream response headers (CLIProxyAPI:
   `passthrough-headers: true`); one that strips them gets a clear error, not

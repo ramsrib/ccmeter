@@ -44,6 +44,9 @@ const CLAUDE_UA = "claude-code/2.1.201";
 // serves. The reply is one token and is thrown away.
 const PROBE_MODEL = process.env.CCMETER_PROBE_MODEL || "claude-haiku-4-5-20251001";
 const PROBE_TIMEOUT_MS = 15_000;
+// Not "run --direct": that meters the Keychain login, which may not be the
+// account this session spends.
+const DIRECT_HINT = "--direct meters the claude.ai login instead, which may be a different account";
 
 interface UsageWindow {
   pct: number;
@@ -100,15 +103,18 @@ async function getClaudeUsage(direct: boolean): Promise<ClaudeUsage> {
     }
     return getGatewayUsage(route, loginToken);
   }
-  if (route?.oauthToken)
+  // Anthropic only takes a Bearer credential that is an OAuth token, so one
+  // in ANTHROPIC_AUTH_TOKEN is a subscription just as CLAUDE_CODE_OAUTH_TOKEN is.
+  const oauthToken = route?.authToken ?? route?.oauthToken;
+  if (route && oauthToken)
     // A `claude setup-token` token is inference-only, and the usage endpoint
     // wants the user:profile scope on top. The probe needs only inference.
-    return getOAuthUsage(route.oauthToken, undefined, route, () => getGatewayUsage(route));
+    return getOAuthUsage(oauthToken, undefined, route, () => getGatewayUsage(route));
   if (route)
     // An API key straight to Anthropic: pay-as-you-go, there are no windows.
     return {
       ok: false,
-      error: `${route.authToken ? "ANTHROPIC_AUTH_TOKEN" : "ANTHROPIC_API_KEY"} is set: API billing, no subscription windows (--direct for your login)`,
+      error: `ANTHROPIC_API_KEY is set: API billing, no subscription windows (${DIRECT_HINT})`,
       route: { baseUrl: route.baseUrl, auth: routeAuth(route) },
     };
 
@@ -243,20 +249,24 @@ async function getGatewayUsage(route: ClaudeRoute, loginToken?: string): Promise
   } catch (e) {
     return { ok: false, error: `${host}: request failed: ${(e as Error).message}`, route: routeInfo };
   }
-  // The headers are all we came for; a body that errors on the way out is no reason to lose them.
-  res.body?.cancel().catch(() => {});
-
   const h = res.headers;
   const [fiveHour, weekly, fable, overage] = UNIFIED_WINDOWS.map((k) => unifiedWindow(h, k));
   if (!fiveHour && !weekly) {
     // Written to be pasted into an agent as-is: what was sent, what came back,
-    // and the causes that fit it.
+    // and the causes that fit it. A refusal's body says why (unknown model, bad
+    // key), so keep the start of it; the fetch timeout still bounds the read.
+    let body = "";
+    if (!res.ok) body = (await res.text().catch(() => "")).replace(/\s+/g, " ").trim().slice(0, 300);
+    else res.body?.cancel().catch(() => {});
     const why = res.ok
-      ? `POST /v1/messages returned HTTP ${res.status} without anthropic-ratelimit-unified-* headers. ` +
+      ? `POST /v1/messages (model ${PROBE_MODEL}) returned HTTP ${res.status} without anthropic-ratelimit-unified-* headers. ` +
         "Either the gateway strips upstream response headers, or it isn't serving this model from a Claude subscription"
-      : `POST /v1/messages returned HTTP ${res.status} without anthropic-ratelimit-unified-* headers`;
-    return { ok: false, error: `${host}: ${why} (--direct meters your claude.ai login)`, route: routeInfo };
+      : `POST /v1/messages (model ${PROBE_MODEL}) returned HTTP ${res.status} without anthropic-ratelimit-unified-* headers` +
+        (body ? `: ${body}` : "");
+    return { ok: false, error: `${host}: ${why} (${DIRECT_HINT})`, route: routeInfo };
   }
+  // The headers are all we came for; a body that errors on the way out is no reason to lose them.
+  res.body?.cancel().catch(() => {});
 
   const out: ClaudeUsage = { ok: true, fiveHour, weekly, route: routeInfo };
   if (fable) out.scoped = [{ label: "Fable", group: "weekly", window: { ...fable, resetsAt: null } }];
@@ -380,6 +390,8 @@ function groupRows(
   return rows;
 }
 
+const isAnthropic = (baseUrl: string) => new URL(baseUrl).host === "api.anthropic.com";
+
 function providerHeader(style: Style, name: string, plan: string | undefined, right: string): string {
   const tag = plan ? ` ${style.cyan(plan)}` : "";
   const suffix = right ? `  ${style.dim(`· ${right}`)}` : "";
@@ -389,7 +401,7 @@ function providerHeader(style: Style, name: string, plan: string | undefined, ri
 function renderClaude(style: Style, u: ClaudeUsage): string[] {
   if (!u.ok)
     return [providerHeader(style, "Claude", u.plan, ""), `  ${style.red(u.error ?? "unavailable")}`];
-  const lines = [providerHeader(style, "Claude", u.plan, u.route ? `via ${new URL(u.route.baseUrl).host}` : "live")];
+  const lines = [providerHeader(style, "Claude", u.plan, u.route && !isAnthropic(u.route.baseUrl) ? `via ${new URL(u.route.baseUrl).host}` : "live")];
   // `group` is the API's name for the parent window; the label is what we print.
   const rendered = new Set(["session", "weekly"]);
   lines.push(...groupRows(style, "5h", "session", u.fiveHour, u.scoped));
