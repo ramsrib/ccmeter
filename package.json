@@ -1,6 +1,6 @@
 {
   "name": "ccmeter",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Usage meters for Claude Code and Codex — ccmeter watches the subscription budget, ctxmeter watches the context window, ccburn shows where the budget went.",
   "license": "MIT",
