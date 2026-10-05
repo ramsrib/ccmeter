@@ -109,7 +109,9 @@ Every run appends its readings to `~/.local/state/ccmeter/history.jsonl`
 (`$XDG_STATE_HOME` is honoured; `CCMETER_HISTORY` moves the file,
 `CCMETER_NO_HISTORY=1` turns it off). Claude Code records tokens but never the
 window percentages, so this is the only record of how they moved; `ccburn`
-lines it up against the transcripts. The file trims itself to the last 35 days
+lines it up against the transcripts. Extra-usage credits are logged too, as the
+running total the endpoint reports; it carries no reset time, so a total that
+drops between readings marks the start of a new billing month. The file trims itself to the last 35 days
 past 8MB.
 
 Exit status is non-zero only if *both* providers fail, which makes it safe to

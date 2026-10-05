@@ -25,6 +25,9 @@ export interface HistoryEntry {
     fiveHour?: HistoryWindow;
     weekly?: HistoryWindow;
     scoped?: { label: string; group: string; window: HistoryWindow }[];
+    // Extra-usage credits. A running total against a monthly limit, with no
+    // reset time on the endpoint; a gateway reading carries only pct.
+    credits?: { pct: number; used?: number; limit?: number; currency?: string };
   };
   codex?: {
     capturedAt?: number; // when Codex took the snapshot, not when we read it

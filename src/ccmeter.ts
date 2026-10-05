@@ -494,7 +494,14 @@ async function main() {
   await appendHistory({
     at: Date.now(),
     claude: claude.ok
-      ? { route: claude.route, plan: claude.plan, fiveHour: claude.fiveHour, weekly: claude.weekly, scoped: claude.scoped }
+      ? {
+          route: claude.route,
+          plan: claude.plan,
+          fiveHour: claude.fiveHour,
+          weekly: claude.weekly,
+          scoped: claude.scoped,
+          credits: claude.credits,
+        }
       : undefined,
     codex: codex.ok ? { capturedAt: codex.capturedAt, fiveHour: codex.fiveHour, weekly: codex.weekly } : undefined,
   });
