@@ -9,10 +9,12 @@
  *            records each API message's model and token usage. There are no
  *            percentages there, so spend is priced at Anthropic's API rates —
  *            an estimate of the share, not the subscription's own accounting.
- *   Codex  : every rollout under ~/.codex/sessions records each turn's tokens
- *            next to the account-wide weekly percentage. Each rise in that
- *            percentage is split across the tokens spent since the previous
- *            reading, so Codex shares are in real weekly-window points.
+ *   Codex  : every rollout (.jsonl or .jsonl.zst) under ~/.codex/sessions records
+ *            each turn's tokens next to the account-wide weekly percentage.
+ *            Each rise is split across the tokens spent since the previous
+ *            reading, so Codex shares are in real weekly-window points. Tokens
+ *            are also priced at OpenAI's standard API rates, an estimate like
+ *            Claude's, for comparison in USD.
  *
  * Sessions that run a GPT model through a gateway (claude-proxy --model
  * gpt-6-sol) log to Claude transcripts but spend Codex quota, so they're
@@ -28,7 +30,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { readHistory, type HistoryEntry } from "./lib/history.ts";
 import { colorEnabled, makeStyle, type Style } from "./lib/format.ts";
-import { jsonlRecursive } from "./lib/walk.ts";
+import { jsonlRecursive, readJsonl } from "./lib/walk.ts";
 
 const HOME = homedir();
 const WEEK_MS = 7 * 24 * 3600 * 1000;
@@ -61,10 +63,32 @@ function claudePrice(model: string): Price {
   return PRICES.find(([p]) => bare.startsWith(p))?.[1] ?? UNKNOWN_CLAUDE;
 }
 
-// Codex has no published per-token rates for its subscription models, and
-// needs none: the weekly percentage is recorded, and these weights only decide
-// how each rise is split between the turns that caused it. Cached input costs
-// a tenth of fresh input and output about four times it, as on OpenAI's API.
+// USD per million tokens at OpenAI's standard API rates (as of 2026-10-17).
+// https://developers.openai.com/api/docs/pricing
+// First match wins, so longer prefixes come first. Requests above 272K input
+// tokens use 2x input/cache and 1.5x output rates for the entire request.
+const CODEX_PRICES: [string, Price][] = [
+  ["gpt-6.1-sol", { input: 2, cacheRead: 0.1, output: 10 }],
+  ["gpt-6-astra", { input: 10, cacheRead: 1, output: 50 }],
+  ["gpt-6-luna", { input: 0.1, cacheRead: 0.01, output: 0.5 }],
+  ["gpt-6-sol", { input: 2, cacheRead: 0.2, output: 10 }],
+  ["gpt-5.6-sol", { input: 4, cacheRead: 0.4, output: 20 }],
+  ["gpt-5.6-terra", { input: 2, cacheRead: 0.2, output: 12 }],
+  ["gpt-5.6-luna", { input: 0.2, cacheRead: 0.02, output: 1.2 }],
+  ["gpt-5.5", { input: 5, cacheRead: 0.5, output: 30 }],
+];
+// Explicit fallback for unknown models: estimate at gpt-6.1-sol rates.
+const UNKNOWN_CODEX = CODEX_PRICES.find(([p]) => p === "gpt-6.1-sol")![1];
+
+function codexUsd(model: string, fresh: number, cached: number, output: number, promptTokens = 0): number {
+  const bare = model.replace(/^[a-z]+\//, "");
+  const pr = CODEX_PRICES.find(([p]) => bare.startsWith(p))?.[1] ?? UNKNOWN_CODEX;
+  const long = promptTokens > 272_000;
+  return ((fresh * pr.input + cached * pr.cacheRead) * (long ? 2 : 1) + output * pr.output * (long ? 1.5 : 1)) / 1e6;
+}
+
+// These weights only decide how each weekly rise is split between turns.
+// Keep them independent of API pricing so existing point attribution is stable.
 const codexUnits = (fresh: number, cached: number, output: number) => fresh + 0.1 * cached + 4 * output;
 
 // ------------------------------------------------------------------ records
@@ -79,6 +103,7 @@ interface Spend {
   caller: string; // main, subagent:<type>, codex exec, …
   model: string;
   cost: number; // claude: USD at API rates · codex: weighted tokens (see codexUnits)
+  usd: number; // estimated USD at the provider's standard API rates
   points: number; // codex: weekly-window points allocated to this call
   tokens: { input: number; cacheWrite: number; cacheRead: number; output: number };
 }
@@ -155,7 +180,7 @@ async function collectClaude(sinceMs: number, sessions: Map<string, SessionInfo>
     let caller = "main";
     if (sub) {
       try {
-        const meta = JSON.parse(await readFile(path.replace(/\.jsonl$/, ".meta.json"), "utf8"));
+        const meta = JSON.parse(await readFile(path.replace(/\.jsonl(?:\.zst)?$/, ".meta.json"), "utf8"));
         caller = `subagent:${meta.agentType ?? "?"}`;
       } catch {
         caller = "subagent";
@@ -163,7 +188,7 @@ async function collectClaude(sinceMs: number, sessions: Map<string, SessionInfo>
     }
     let text: string;
     try {
-      text = await readFile(path, "utf8");
+      text = await readJsonl(path);
     } catch {
       continue;
     }
@@ -229,6 +254,7 @@ async function collectClaude(sinceMs: number, sessions: Map<string, SessionInfo>
           caller: "claude code (gateway)",
           model,
           cost: codexUnits(input + cacheWrite, cacheRead, output),
+          usd: codexUsd(model, input + cacheWrite, cacheRead, output, input + cacheWrite + cacheRead),
           points: 0,
           tokens,
         });
@@ -244,7 +270,10 @@ async function collectClaude(sinceMs: number, sessions: Map<string, SessionInfo>
           cacheRead * pr.cacheRead +
           output * pr.output) /
         1e6;
-      out.push({ t, provider: "claude", session, caller: spendCaller, model: model.replace(/\[1m\]$/, ""), cost, points: 0, tokens });
+      out.push({
+        t, provider: "claude", session, caller: spendCaller,
+        model: model.replace(/\[1m\]$/, ""), cost, usd: cost, points: 0, tokens,
+      });
     }
   }
   return out;
@@ -259,14 +288,18 @@ async function collectCodex(
 ): Promise<{ spends: Spend[]; readings: Reading[] }> {
   const spends: Spend[] = [];
   const readings: Reading[] = [];
-  for (const path of await filesSince(join(HOME, ".codex", "sessions"), sinceMs)) {
+  const seen = new Set<string>();
+  // Prefer plain files if both encodings exist; only count each rollout once.
+  for (const path of (await filesSince(join(HOME, ".codex", "sessions"), sinceMs)).sort()) {
+    const session = basename(path).replace(/\.jsonl(?:\.zst)?$/, "");
+    if (seen.has(session)) continue;
     let text: string;
     try {
-      text = await readFile(path, "utf8");
+      text = await readJsonl(path);
     } catch {
       continue;
     }
-    const session = basename(path, ".jsonl");
+    seen.add(session);
     const first = spends.length;
     const info: SessionInfo = { provider: "codex", project: "?", caller: "?", prompt: "" };
     let model = "?";
@@ -331,6 +364,7 @@ async function collectCodex(
               caller: "",
               model,
               cost: codexUnits(d.fresh, d.cached, d.output),
+              usd: codexUsd(model, d.fresh, d.cached, d.output, p.info?.last_token_usage?.input_tokens),
               points: 0,
               tokens: { input: d.fresh, cacheWrite: 0, cacheRead: d.cached, output: d.output },
             });
@@ -408,6 +442,7 @@ function allocatePoints(spends: Spend[], readings: Reading[]): void {
 interface Row {
   key: string;
   cost: number;
+  usd: number;
   points: number;
   calls: number;
   sessions: Set<string>;
@@ -417,9 +452,9 @@ interface Report {
   provider: Provider;
   since: number;
   sinceWhy: string;
-  total: { cost: number; points: number; calls: number };
+  total: { cost: number; usd: number; points: number; calls: number };
   range?: { from: number; to: number }; // codex weekly % across the window
-  groups: { key: string; share: number; cost: number; points: number; calls: number; sessions: number }[];
+  groups: { key: string; share: number; cost: number; usd: number; points: number; calls: number; sessions: number }[];
   sessions: {
     id: string;
     from: number;
@@ -429,9 +464,10 @@ interface Report {
     caller: string;
     prompt: string;
     cost: number;
+    usd: number;
     points: number;
   }[];
-  hours: { hour: number; cost: number; points: number; readings?: string }[];
+  hours: { hour: number; cost: number; usd: number; points: number; readings?: string }[];
 }
 
 function build(
@@ -446,38 +482,42 @@ function build(
   history: HistoryEntry[],
 ): Report {
   const metric = (x: { cost: number; points: number }) => (provider === "codex" ? x.points : x.cost);
-  const total = { cost: 0, points: 0, calls: spends.length };
+  const total = { cost: 0, usd: 0, points: 0, calls: spends.length };
   const groups = new Map<string, Row>();
   const perSession = new Map<
     string,
-    { from: number; to: number; cost: number; points: number; sub: number; models: Map<string, number> }
+    { from: number; to: number; cost: number; usd: number; points: number; sub: number; models: Map<string, number> }
   >();
-  const hours = new Map<number, { cost: number; points: number }>();
+  const hours = new Map<number, { cost: number; usd: number; points: number }>();
 
   for (const s of spends) {
     total.cost += s.cost;
+    total.usd += s.usd;
     total.points += s.points;
     const info = sessions.get(s.session);
     const key = by === "model" ? s.model : by === "caller" ? s.caller : (info?.project ?? "?");
-    const g = groups.get(key) ?? { key, cost: 0, points: 0, calls: 0, sessions: new Set<string>() };
+    const g = groups.get(key) ?? { key, cost: 0, usd: 0, points: 0, calls: 0, sessions: new Set<string>() };
     g.cost += s.cost;
+    g.usd += s.usd;
     g.points += s.points;
     g.calls++;
     g.sessions.add(s.session);
     groups.set(key, g);
 
-    const ps = perSession.get(s.session) ?? { from: s.t, to: s.t, cost: 0, points: 0, sub: 0, models: new Map() };
+    const ps = perSession.get(s.session) ?? { from: s.t, to: s.t, cost: 0, usd: 0, points: 0, sub: 0, models: new Map() };
     if (s.caller.startsWith("subagent")) ps.sub += metric(s);
     ps.from = Math.min(ps.from, s.t);
     ps.to = Math.max(ps.to, s.t);
     ps.cost += s.cost;
+    ps.usd += s.usd;
     ps.points += s.points;
     ps.models.set(s.model, (ps.models.get(s.model) ?? 0) + s.cost);
     perSession.set(s.session, ps);
 
     const h = Math.floor(s.t / 3600e3) * 3600e3;
-    const hb = hours.get(h) ?? { cost: 0, points: 0 };
+    const hb = hours.get(h) ?? { cost: 0, usd: 0, points: 0 };
     hb.cost += s.cost;
+    hb.usd += s.usd;
     hb.points += s.points;
     hours.set(h, hb);
   }
@@ -495,6 +535,7 @@ function build(
         key: g.key,
         share: (metric(g) / denom) * 100,
         cost: g.cost,
+        usd: g.usd,
         points: g.points,
         calls: g.calls,
         sessions: g.sessions.size,
@@ -519,6 +560,7 @@ function build(
               : (info?.caller ?? "?"),
           prompt: info?.prompt ?? "",
           cost: ps.cost,
+          usd: ps.usd,
           points: ps.points,
         };
       }),
@@ -565,11 +607,13 @@ const fit = (s: string, w: number) => (s.length > w ? s.slice(0, w - 1) + "…" 
 
 function render(style: Style, r: Report, by: string, timeline: boolean): string[] {
   const codex = r.provider === "codex";
-  const amount = (x: { cost: number; points: number }) => (codex ? pts(x.points) : usd(x.cost));
+  const amount = (x: { cost: number; usd: number; points: number }) =>
+    (codex ? `${pts(x.points)} · ${usd(x.usd)}` : usd(x.cost)).padStart(codex ? 16 : 6);
+  const weekly = r.range
+    ? `weekly ${Math.round(r.range.from)}→${Math.round(r.range.to)}%, ${pts(r.total.points)} attributed`
+    : "no weekly readings in this window";
   const headline = codex
-    ? r.range
-      ? `weekly ${Math.round(r.range.from)}→${Math.round(r.range.to)}%, ${pts(r.total.points)} attributed`
-      : "no weekly readings in this window"
+    ? `${weekly} · ${usd(r.total.usd)} at API rates`
     : `${usd(r.total.cost)} at API rates`;
   const lines = [
     `${style.bold(codex ? "Codex" : "Claude")}  ${style.dim(`· since ${clock(r.since)} (${r.sinceWhy}) · ${headline} · ${r.total.calls} calls`)}`,
@@ -579,22 +623,22 @@ function render(style: Style, r: Report, by: string, timeline: boolean): string[
   lines.push(`  ${style.gray(`by ${by}`)}`);
   for (const g of r.groups)
     lines.push(
-      `    ${g.share.toFixed(0).padStart(3)}%  ${amount(g).padStart(6)}  ${fit(g.key, 42)} ${style.dim(`${g.sessions} session${g.sessions === 1 ? "" : "s"}`)}`,
+      `    ${g.share.toFixed(0).padStart(3)}%  ${amount(g)}  ${fit(g.key, 42)} ${style.dim(`${g.sessions} session${g.sessions === 1 ? "" : "s"}`)}`,
     );
 
   lines.push(`  ${style.gray("top sessions")}`);
   for (const s of r.sessions) {
     lines.push(
-      `    ${amount(s).padStart(6)}  ${clock(s.from)}–${until(s.from, s.to)}  ${fit(s.model.replace(/^claude-/, ""), 12)} ${fit(s.project, 30)} ${style.dim(s.caller)}`,
+      `    ${amount(s)}  ${clock(s.from)}–${until(s.from, s.to)}  ${fit(s.model.replace(/^claude-/, ""), 12)} ${fit(s.project, 30)} ${style.dim(s.caller)}`,
     );
-    if (s.prompt) lines.push(`            ${style.dim(`"${s.prompt.slice(0, 110)}${s.prompt.length > 110 ? "…" : ""}"`)}`);
+    if (s.prompt) lines.push(`${" ".repeat(codex ? 22 : 12)}${style.dim(`"${s.prompt.slice(0, 110)}${s.prompt.length > 110 ? "…" : ""}"`)}`);
   }
 
   const metric = (h: { cost: number; points: number }) => (codex ? h.points : h.cost);
   const hours = timeline ? r.hours : [...r.hours].sort((a, b) => metric(b) - metric(a)).slice(0, 5);
   lines.push(`  ${style.gray(timeline ? "by hour" : "steepest hours")}`);
   for (const h of hours)
-    lines.push(`    ${clock(h.hour)}  ${amount(h).padStart(6)}  ${style.dim(h.readings ?? "")}`);
+    lines.push(`    ${clock(h.hour)}  ${amount(h)}  ${style.dim(h.readings ?? "")}`);
   return lines;
 }
 
@@ -615,7 +659,10 @@ usage: ccburn [--since 6h|2d|1w|DATE] [--by project|model|caller] [--top N]
 
 Claude spend is priced at Anthropic's API rates from local transcripts: an
 estimate of the share, not the subscription's own accounting. Codex spend is in
-weekly-window points, from the percentages Codex records next to each turn.
+weekly-window points, from the percentages Codex records next to each turn,
+alongside an estimate in USD at OpenAI's standard API rates. Unknown Codex
+models use gpt-6.1-sol rates; requests above 272K input tokens use long-context
+rates. Plain (.jsonl) and compressed (.jsonl.zst) rollouts are read.
 Only this machine's logs are read.`;
 
 async function main() {

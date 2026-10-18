@@ -19,10 +19,9 @@ import { parseArgs } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFile } from "node:fs/promises";
 import { claudeRouteFromEnv, loadClaudeCreds, routeAuth, type ClaudeRoute } from "./lib/creds.ts";
 import { appendHistory } from "./lib/history.ts";
-import { jsonlRecursive } from "./lib/walk.ts";
+import { jsonlRecursive, readJsonl } from "./lib/walk.ts";
 import {
   bar,
   colorEnabled,
@@ -316,7 +315,7 @@ async function getCodexUsage(): Promise<CodexUsage> {
     if (best && mtime < best.at) break;
     let text: string;
     try {
-      text = await readFile(path, "utf8");
+      text = await readJsonl(path);
     } catch {
       continue;
     }

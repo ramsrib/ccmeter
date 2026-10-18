@@ -34,16 +34,16 @@ $ ctxmeter
 
 ```
 $ ccburn --codex
-Codex  · since 09/26, 09:58 (weekly window) · weekly 0→91%, +91% attributed · 3402 calls
+Codex  · since 09/26, 09:58 (weekly window) · weekly 0→91%, +91% attributed · $412 at API rates · 3402 calls
   by project
-     37%    +33%  acme/api                                   99 sessions
-     33%    +30%  acme/runtime                               50 sessions
-      5%   +4.6%  dotfiles                                   8 sessions
+     37%    +33% · $152  acme/api                                   99 sessions
+     33%    +30% · $136  acme/runtime                               50 sessions
+      5%   +4.6% · $20.60  dotfiles                                 8 sessions
   top sessions
-     +4.2%  09/27, 05:20–07:38  gpt-6-astra  acme/api                       codex exec
+     +4.2% · $17.30  09/27, 05:20–07:38  gpt-6-astra  acme/api                       codex exec
             "Independent review of PR #262 at HEAD 65425224. Read-only…"
   steepest hours
-    09/28, 12:00   +8.0%  read weekly 81→89%
+    09/28, 12:00   +8.0% · $32.96  read weekly 81→89%
 ```
 
 ## Install
@@ -102,7 +102,7 @@ ccmeter --no-color
   gateway ccmeter is the only view.
 - **Codex** — has no queryable usage API, so ccmeter reads the most recent
   rate-limit snapshot Codex writes to its rollout logs
-  (`~/.codex/sessions/**.jsonl`) — the same numbers the TUI `/status` shows.
+  (`~/.codex/sessions/**/*.jsonl` and `*.jsonl.zst`) — the same numbers the TUI `/status` shows.
   Free (no API call), but only as fresh as your last Codex turn.
 
 Every run appends its readings to `~/.local/state/ccmeter/history.jsonl`
@@ -180,6 +180,12 @@ were asked, and the steepest hours.
   pinned on whatever ran just before the tick.
   An hour's `+N%` is what its turns caused; the `read` note beside it is what
   the snapshots taken in that hour said, which can lag the turns behind them.
+  Alongside points, tokens are priced in USD at [OpenAI's standard API rates](https://developers.openai.com/api/docs/pricing)
+  (as of 2026-10-17), an estimate for comparison with Claude, not subscription
+  billing. Requests above 272,000 input tokens use long-context rates (2x input
+  and cached input, 1.5x output); missing prompt sizes use short rates. Unknown
+  models fall back to gpt-6.1-sol rates. Older compressed `*.jsonl.zst` rollouts
+  are read alongside plain `*.jsonl`, so archived days remain in the history.
 - **Claude** transcripts carry tokens but no percentages, so Claude spend is
   priced at Anthropic's API rates: an estimate of each share, not the
   subscription's own accounting. A session's subagents roll into its row. With
@@ -188,7 +194,12 @@ were asked, and the steepest hours.
   7 days.
 - Sessions that run a GPT model through a gateway (Claude Code with
   `--model gpt-…` behind a proxy) log to Claude transcripts but spend Codex
-  quota, so they count under Codex.
+  quota, so they count under Codex, with the same API-rate USD estimate.
+
+JSON totals, groups, sessions and hours include `usd` for both providers
+(equal to `cost` for Claude). Existing `cost` fields retain their meanings:
+Claude API-rate dollars, Codex weighted tokens. Codex `points`, shares and
+sorting still use weekly-window attribution, independently of USD pricing.
 
 Only this machine's logs are read: usage from other machines, or from the
 Codex and Claude apps, shows up in Codex's percentage but not in its sessions.
@@ -203,7 +214,7 @@ src/
   lib/creds.ts     locate Claude / Codex credentials (keychain, ~/.claude, ~/.codex)
   lib/format.ts    color, utilization bars, percent / reset-time / money formatting
   lib/history.ts   the readings log ccmeter appends and ccburn reads
-  lib/walk.ts      recursive *.jsonl search (no bun Glob, so node works too)
+  lib/walk.ts      find/read *.jsonl and *.jsonl.zst (no bun Glob, so node works too)
   ccmeter.ts       subscription usage
   ctxmeter.ts      context-window usage
   ccburn.ts        where the usage went
