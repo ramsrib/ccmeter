@@ -8,16 +8,19 @@
  *            utilization and, when enabled, extra-usage credit spend.
  *            When ANTHROPIC_BASE_URL routes Claude Code through a gateway, it
  *            meters that route instead (see getGatewayUsage).
- *   Codex  : the most recent rate-limit snapshot Codex persists to its rollout
- *            logs (~/.codex/sessions/**.jsonl) — the same numbers the TUI
- *            `/status` shows. Free (no API call), but only as fresh as your
- *            last Codex turn.
+ *   Codex  : live, by asking a short-lived `codex app-server` for
+ *            account/rateLimits/read (the numbers the TUI `/status` shows,
+ *            fetched from OpenAI now). When that fails (codex missing or too
+ *            old, logged out, offline), the most recent rate-limit snapshot
+ *            Codex persisted to its rollout logs (~/.codex/sessions/**.jsonl),
+ *            which is only as fresh as the last Codex turn on this machine.
  *
  * Flags:  --json   machine-readable output  |  --direct  |  --no-color  |  -h/--help
  */
 import { parseArgs } from "node:util";
+import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeRouteFromEnv, loadClaudeCreds, routeAuth, type ClaudeRoute } from "./lib/creds.ts";
 import { appendHistory } from "./lib/history.ts";
@@ -76,7 +79,8 @@ interface CodexUsage {
   ok: boolean;
   error?: string;
   plan?: string;
-  capturedAt?: number; // epoch ms of the snapshot
+  capturedAt?: number; // epoch ms of the snapshot (or of the live read)
+  live?: boolean; // read from OpenAI just now, not a rollout-log snapshot
   fiveHour?: UsageWindow;
   weekly?: UsageWindow;
 }
@@ -275,6 +279,112 @@ async function getGatewayUsage(route: ClaudeRoute, loginToken?: string): Promise
   return out;
 }
 
+// ------------------------------------------------------------------ Codex (live)
+
+// Generous for a cold start; a warm `codex app-server` answers in under a second.
+const CODEX_LIVE_TIMEOUT_MS = 10_000;
+
+/** Sort Codex windows into 5h / weekly by their own duration (see the snapshot reader). */
+function bucketCodexWindows(windows: ({ mins: number; window: UsageWindow } | null)[]) {
+  let fiveHour: UsageWindow | undefined;
+  let weekly: UsageWindow | undefined;
+  for (const w of windows) {
+    if (!w) continue;
+    if (w.mins <= 24 * 60) fiveHour = w.window;
+    else weekly = w.window;
+  }
+  return { fiveHour, weekly };
+}
+
+/**
+ * Ask Codex itself, live: start `codex app-server` (its JSON-RPC mode for other
+ * programs, newline-delimited over stdio), send initialize + account/rateLimits/read,
+ * and close it. Nothing has to be running already. Resolves null on any failure,
+ * so the caller can fall back to the rollout-log snapshot.
+ */
+function getCodexLive(): Promise<CodexUsage | null> {
+  return new Promise((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn("codex", ["app-server"], { cwd: tmpdir(), stdio: ["pipe", "pipe", "ignore"] });
+    } catch {
+      return resolve(null);
+    }
+    let settled = false;
+    // codex app-server exits on its own when stdin closes, so a killed ccmeter
+    // can't strand it; this covers a normal exit while the read is pending.
+    const killChild = () => child.kill();
+    process.once("exit", killChild);
+    const finish = (u: CodexUsage | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.removeListener("exit", killChild);
+      child.kill();
+      resolve(u);
+    };
+    const timer = setTimeout(() => finish(null), CODEX_LIVE_TIMEOUT_MS);
+    child.on("error", () => finish(null)); // codex not installed
+    child.on("exit", () => finish(null));
+    // A child that dies before reading its input surfaces as EPIPE here, not as a throw.
+    child.stdin?.on("error", () => finish(null));
+    const send = (m: object) => {
+      try {
+        child.stdin?.write(JSON.stringify(m) + "\n");
+      } catch {
+        finish(null);
+      }
+    };
+
+    let buf = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      buf += chunk.toString("utf8");
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        let m: any;
+        try {
+          m = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (!m || typeof m !== "object") continue;
+        if (m.id === 1) {
+          if (!m.result) return finish(null);
+          send({ method: "initialized" });
+          send({ id: 2, method: "account/rateLimits/read", params: {} });
+        } else if (m.id === 2) {
+          // The account-wide budget is limit id "codex"; model-scoped caps ride alongside,
+          // and the top-level rateLimits counts only when it is that same budget.
+          let rl = m.result?.rateLimitsByLimitId?.codex;
+          const top = m.result?.rateLimits;
+          if (!rl && top && (top.limitId == null || top.limitId === "codex")) rl = top;
+          const valid = (w: any) =>
+            w == null || (typeof w === "object" && typeof w.usedPercent === "number" && typeof w.windowDurationMins === "number");
+          // Anything off-shape falls back to the snapshot rather than showing as live.
+          if (!rl || typeof rl !== "object" || !valid(rl.primary) || !valid(rl.secondary) || (!rl.primary && !rl.secondary))
+            return finish(null);
+          const win = (w: any) =>
+            w
+              ? {
+                  mins: w.windowDurationMins,
+                  window: { pct: w.usedPercent, resetsAt: typeof w.resetsAt === "number" ? w.resetsAt * 1000 : null },
+                }
+              : null;
+          const { fiveHour, weekly } = bucketCodexWindows([win(rl.primary), win(rl.secondary)]);
+          finish({ ok: true, live: true, plan: rl.planType ?? undefined, capturedAt: Date.now(), fiveHour, weekly });
+        }
+      }
+    });
+    send({ id: 1, method: "initialize", params: { clientInfo: { name: "ccmeter", version: "0" } } });
+  });
+}
+
+async function getCodexUsage(): Promise<CodexUsage> {
+  return (await getCodexLive()) ?? getCodexSnapshot();
+}
+
 // -------------------------------------------------------- Codex (cached snapshot)
 
 /** Depth-first search for a `rate_limits` object anywhere in a rollout record. */
@@ -289,7 +399,7 @@ function findRateLimits(o: any): any {
   return null;
 }
 
-async function getCodexUsage(): Promise<CodexUsage> {
+async function getCodexSnapshot(): Promise<CodexUsage> {
   const base = join(homedir(), ".codex", "sessions");
   if (!existsSync(base)) return { ok: false, error: "no Codex sessions — run codex once" };
 
@@ -350,14 +460,9 @@ async function getCodexUsage(): Promise<CodexUsage> {
     // window "resetting in 6d", which is the tell — and left weekly blank.
     // Classifying by each window's own duration is correct for both shapes, and
     // means the 5h row simply reappears by itself when OpenAI restores the cap.
-    let fiveHour: UsageWindow | undefined;
-    let weekly: UsageWindow | undefined;
-    for (const w of [last.primary, last.secondary]) {
-      if (!w) continue;
-      const mins = w.window_minutes ?? 0;
-      if (mins <= 24 * 60) fiveHour = win(w);
-      else weekly = win(w);
-    }
+    const { fiveHour, weekly } = bucketCodexWindows(
+      [last.primary, last.secondary].map((w) => (w ? { mins: w.window_minutes ?? 0, window: win(w)! } : null)),
+    );
 
     return { ok: true, plan: last.plan_type, capturedAt: best.at, fiveHour, weekly };
   }
@@ -439,7 +544,7 @@ function renderClaude(style: Style, u: ClaudeUsage): string[] {
 function renderCodex(style: Style, u: CodexUsage): string[] {
   if (!u.ok)
     return [providerHeader(style, "Codex", u.plan, ""), `  ${style.red(u.error ?? "unavailable")}`];
-  const age = u.capturedAt ? `snapshot ${humanAgo(Date.now() - u.capturedAt)}` : "";
+  const age = u.live ? "live" : u.capturedAt ? `snapshot ${humanAgo(Date.now() - u.capturedAt)}` : "";
   const lines = [providerHeader(style, "Codex", u.plan, age)];
   // Only draw the windows Codex actually reports. While the 5h cap is suspended
   // (see getCodexUsage), a permanent "5h —" row is noise that reads like a bug in
@@ -469,8 +574,9 @@ the rate-limit headers on a one-token probe sent through that gateway
 Each run appends its readings to ~/.local/state/ccmeter/history.jsonl
 (CCMETER_HISTORY moves it, CCMETER_NO_HISTORY=1 turns it off); ccburn
 reads it to show how the windows moved.
-Codex numbers are the latest snapshot from ~/.codex rollout logs
-(as fresh as your last Codex turn).`;
+Codex numbers are a live read from a short-lived \`codex app-server\`
+(account/rateLimits/read). If that fails, they are the latest snapshot
+from ~/.codex rollout logs (as fresh as your last Codex turn).`;
 
 async function main() {
   const { values } = parseArgs({

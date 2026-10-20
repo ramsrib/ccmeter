@@ -19,7 +19,7 @@ Claude max  · live
   weekly     47%  █████░░░░░  resets in 3d 2h · 02:00 PM
   └ Fable    71%  ███████░░░  resets in 3d 2h · 02:00 PM · draws from weekly
 
-Codex pro  · snapshot 4m ago
+Codex pro  · live
   weekly      9%  █░░░░░░░░░  resets in 6d 9h · 08:25 PM
 ```
 
@@ -100,10 +100,13 @@ ccmeter --no-color
   picks for the probe, which may not be the account a given session is pinned
   to. Claude Code itself tracks no limits under a third-party token, so behind a
   gateway ccmeter is the only view.
-- **Codex** — has no queryable usage API, so ccmeter reads the most recent
-  rate-limit snapshot Codex writes to its rollout logs
-  (`~/.codex/sessions/**/*.jsonl` and `*.jsonl.zst`) — the same numbers the TUI `/status` shows.
-  Free (no API call), but only as fresh as your last Codex turn.
+- **Codex** — live: ccmeter starts a short-lived `codex app-server` (Codex's
+  JSON-RPC mode for other programs) and asks it for `account/rateLimits/read`, the
+  numbers the TUI `/status` shows, fetched from OpenAI now. Nothing has to be
+  running already. If that fails (codex missing or too old, logged out, offline),
+  it falls back to the most recent rate-limit snapshot Codex wrote to its rollout
+  logs (`~/.codex/sessions/**/*.jsonl` and `*.jsonl.zst`), which is only as fresh
+  as the last Codex turn on this machine, and says so (`· snapshot 4m ago`).
 
 Every run appends its readings to `~/.local/state/ccmeter/history.jsonl`
 (`$XDG_STATE_HOME` is honoured; `CCMETER_HISTORY` moves the file,
