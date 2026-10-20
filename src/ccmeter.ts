@@ -107,12 +107,16 @@ async function getClaudeUsage(direct: boolean): Promise<ClaudeUsage> {
     }
     return getGatewayUsage(route, loginToken);
   }
-  // Anthropic only takes a Bearer credential that is an OAuth token, so one
-  // in ANTHROPIC_AUTH_TOKEN is a subscription just as CLAUDE_CODE_OAUTH_TOKEN is.
-  const oauthToken = route?.authToken ?? route?.oauthToken;
+  // CLAUDE_CODE_OAUTH_TOKEN is a `claude setup-token` token: inference-only, while
+  // the usage endpoint wants user:profile on top. Asking anyway is refused (403),
+  // and a token that keeps getting refused is throttled there with growing backoff
+  // (429, retry-after 80s, then 3600s; seen on a remote host 2026-10-20), which
+  // also ends the fallback. So go straight to the probe, which needs only inference.
+  if (route?.oauthToken && !route.authToken) return getGatewayUsage(route);
+  // Anthropic only takes a Bearer credential that is an OAuth token, so one in
+  // ANTHROPIC_AUTH_TOKEN is a subscription too, possibly with the full scope.
+  const oauthToken = route?.authToken;
   if (route && oauthToken)
-    // A `claude setup-token` token is inference-only, and the usage endpoint
-    // wants the user:profile scope on top. The probe needs only inference.
     return getOAuthUsage(oauthToken, undefined, route, () => getGatewayUsage(route));
   if (route)
     // An API key straight to Anthropic: pay-as-you-go, there are no windows.

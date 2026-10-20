@@ -94,6 +94,13 @@ ccmeter --no-color
   directly). The probe carries utilization but not the plan name or credit
   amounts, so in `--json` a gateway's `credits` is `{ "pct": … }` alone.
 
+  A `claude setup-token` token in `CLAUDE_CODE_OAUTH_TOKEN` (how a machine you
+  reach over SSH logs in, since its Keychain is locked there) goes straight to
+  the same probe, even with no gateway: the token can't read the usage endpoint,
+  and asking anyway gets it throttled there. So on such a host ccmeter shows the
+  5h and weekly windows and the credit percentage, but no plan name, Fable line
+  or credit amounts (Claude Code's own `/usage` is blank there for the same reason).
+
   It needs a gateway that forwards upstream response headers (CLIProxyAPI:
   `passthrough-headers: true`); one that strips them gets a clear error, not
   wrong numbers. A gateway that pools several accounts meters whichever one it
