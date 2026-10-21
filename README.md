@@ -174,6 +174,7 @@ so a guard that cannot read usage fails closed rather than reading as idle.
 ccburn                       # since each provider's weekly window started
 ccburn --since 6h            # or 2d, 1w, an ISO date
 ccburn --by model            # group by project (default), model or caller
+ccburn --model fable         # only Fable calls: which projects ate the Fable cap
 ccburn --timeline            # every hour, not just the five steepest
 ccburn --codex --json        # one provider, machine-readable
 ```

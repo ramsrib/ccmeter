@@ -20,7 +20,7 @@
  * gpt-6-sol) log to Claude transcripts but spend Codex quota, so they're
  * counted under Codex.
  *
- * Flags:  --since 6h|2d|ISO  --by project|model|caller  --top N  --timeline
+ * Flags:  --since 6h|2d|ISO  --by project|model|caller  --model NAME  --top N  --timeline
  *         --claude | --codex  --json  --no-color  -h/--help
  */
 import { parseArgs } from "node:util";
@@ -452,6 +452,7 @@ interface Report {
   provider: Provider;
   since: number;
   sinceWhy: string;
+  model?: string; // --model filter, when given
   total: { cost: number; usd: number; points: number; calls: number };
   range?: { from: number; to: number }; // codex weekly % across the window
   groups: { key: string; share: number; cost: number; usd: number; points: number; calls: number; sessions: number }[];
@@ -480,6 +481,7 @@ function build(
   top: number,
   readings: Reading[],
   history: HistoryEntry[],
+  model?: string,
 ): Report {
   const metric = (x: { cost: number; points: number }) => (provider === "codex" ? x.points : x.cost);
   const total = { cost: 0, usd: 0, points: 0, calls: spends.length };
@@ -527,6 +529,7 @@ function build(
     provider,
     since,
     sinceWhy,
+    ...(model ? { model } : {}),
     total,
     groups: [...groups.values()]
       .sort((a, b) => metric(b) - metric(a))
@@ -616,7 +619,7 @@ function render(style: Style, r: Report, by: string, timeline: boolean): string[
     ? `${weekly} · ${usd(r.total.usd)} at API rates`
     : `${usd(r.total.cost)} at API rates`;
   const lines = [
-    `${style.bold(codex ? "Codex" : "Claude")}  ${style.dim(`· since ${clock(r.since)} (${r.sinceWhy}) · ${headline} · ${r.total.calls} calls`)}`,
+    `${style.bold(codex ? "Codex" : "Claude")}  ${style.dim(`· since ${clock(r.since)} (${r.sinceWhy})${r.model ? ` · ${r.model} calls only` : ""} · ${headline} · ${r.total.calls} calls`)}`,
   ];
   if (!r.total.calls) return [...lines, `  ${style.dim("nothing spent in this window")}`];
 
@@ -646,12 +649,14 @@ function render(style: Style, r: Report, by: string, timeline: boolean): string[
 
 const HELP = `ccburn — where the Claude and Codex subscription usage went
 
-usage: ccburn [--since 6h|2d|1w|DATE] [--by project|model|caller] [--top N]
-              [--timeline] [--claude | --codex] [--json] [--no-color]
+usage: ccburn [--since 6h|2d|1w|DATE] [--by project|model|caller] [--model NAME]
+              [--top N] [--timeline] [--claude | --codex] [--json] [--no-color]
 
   --since      window start (default: the start of each provider's current
                weekly window, else the last 7 days)
   --by         how to group the first table (default: project)
+  --model      only calls whose model name contains NAME (e.g. fable): where
+               a model-scoped cap like Fable's went, subagent calls included
   --top N      rows per table (default: 8)
   --timeline   every hour, instead of the five steepest
   --claude, --codex   one provider only
@@ -671,6 +676,7 @@ async function main() {
     options: {
       since: { type: "string" },
       by: { type: "string", default: "project" },
+      model: { type: "string" },
       top: { type: "string", default: "8" },
       timeline: { type: "boolean", default: false },
       claude: { type: "boolean", default: false },
@@ -685,6 +691,10 @@ async function main() {
   if (!["project", "model", "caller"].includes(values.by!)) throw new Error(`--by: expected project, model or caller`);
   const top = Math.max(1, Number(values.top) || 8);
   const want = (p: Provider) => (!values.claude && !values.codex) || values[p];
+  // Per call, not per session: a session is labelled by its costliest model,
+  // so Fable subagents under an Opus session would otherwise never show.
+  const model = values.model?.toLowerCase();
+  const ofModel = (s: Spend) => !model || s.model.toLowerCase().includes(model);
 
   const now = Date.now();
   const explicit = values.since ? parseSince(values.since, now) : null;
@@ -716,14 +726,16 @@ async function main() {
   const reports: Report[] = [];
   if (want("claude")) {
     const [from, why] = since(claudeReset);
-    const spends = claudeAll.filter((s) => s.provider === "claude" && s.t >= from);
-    reports.push(build("claude", spends, sessions, from, why, values.by!, top, [], history));
+    const spends = claudeAll.filter((s) => s.provider === "claude" && s.t >= from && ofModel(s));
+    reports.push(build("claude", spends, sessions, from, why, values.by!, top, [], history, values.model));
   }
   if (want("codex")) {
     const [from, why] = since(codexReset);
     const spends = [...codexData.spends, ...claudeAll.filter((s) => s.provider === "codex")].filter((s) => s.t >= from);
     allocatePoints(spends, codexData.readings.filter((r) => r.t >= from));
-    reports.push(build("codex", spends, sessions, from, why, values.by!, top, codexData.readings, history));
+    // Filter after allocating: points are split across every call in a window.
+    const kept = spends.filter(ofModel);
+    reports.push(build("codex", kept, sessions, from, why, values.by!, top, codexData.readings, history, values.model));
   }
 
   if (values.json) {
