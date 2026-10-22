@@ -106,6 +106,7 @@ interface Spend {
   usd: number; // estimated USD at the provider's standard API rates
   points: number; // codex: weekly-window points allocated to this call
   tokens: { input: number; cacheWrite: number; cacheRead: number; output: number };
+  account?: string; // codex: the ChatGPT account the rollout ran under ("" when unrecorded)
 }
 
 interface SessionInfo {
@@ -120,6 +121,7 @@ interface Reading {
   t: number;
   pct: number;
   resetsAt: number | null; // epoch ms
+  account: string; // whose meter this is; "" when the rollout doesn't record it
 }
 
 // ------------------------------------------------------------------ helpers
@@ -285,9 +287,10 @@ async function collectClaude(sinceMs: number, sessions: Map<string, SessionInfo>
 async function collectCodex(
   sinceMs: number,
   sessions: Map<string, SessionInfo>,
-): Promise<{ spends: Spend[]; readings: Reading[] }> {
+): Promise<{ spends: Spend[]; readings: Reading[]; plans: Map<string, string> }> {
   const spends: Spend[] = [];
   const readings: Reading[] = [];
+  const plans = new Map<string, { plan: string; t: number }>(); // account → plan_type, latest by event time
   const seen = new Set<string>();
   // Prefer plain files if both encodings exist; only count each rollout once.
   for (const path of (await filesSince(join(HOME, ".codex", "sessions"), sinceMs)).sort()) {
@@ -303,6 +306,7 @@ async function collectCodex(
     const first = spends.length;
     const info: SessionInfo = { provider: "codex", project: "?", caller: "?", prompt: "" };
     let model = "?";
+    let account = "";
     let prev: { fresh: number; cached: number; output: number } | null = null;
     for (const line of text.split("\n")) {
       const head = line.slice(0, 160);
@@ -329,6 +333,7 @@ async function collectCodex(
         const repo = String(p.git?.repository_url ?? "").match(/([^/:]+?)(\.git)?$/)?.[1];
         if (info.project === "(temp dir)" && repo) info.project = `repo:${repo}`;
         info.caller = String(p.originator ?? p.source ?? "?").replace(/_/g, " ");
+        account = String(p.creator_account_id ?? "");
       } else if (kind === "turn") {
         if (p.model) model = p.model;
       } else if (kind === "prompt") {
@@ -367,13 +372,17 @@ async function collectCodex(
               usd: codexUsd(model, d.fresh, d.cached, d.output, p.info?.last_token_usage?.input_tokens),
               points: 0,
               tokens: { input: d.fresh, cacheWrite: 0, cacheRead: d.cached, output: d.output },
+              account,
             });
         }
         const rl = p.rate_limits;
-        if (rl && (!rl.limit_id || rl.limit_id === "codex") && Number.isFinite(t))
+        if (rl && (!rl.limit_id || rl.limit_id === "codex") && Number.isFinite(t)) {
+          if (account && rl.plan_type && t >= (plans.get(account)?.t ?? -Infinity))
+            plans.set(account, { plan: String(rl.plan_type), t });
           for (const w of [rl.primary, rl.secondary])
             if (w && (w.window_minutes ?? 0) > 24 * 60 && typeof w.used_percent === "number")
-              readings.push({ t, pct: w.used_percent, resetsAt: w.resets_at ? w.resets_at * 1000 : null });
+              readings.push({ t, pct: w.used_percent, resetsAt: w.resets_at ? w.resets_at * 1000 : null, account });
+        }
       }
     }
     sessions.set(session, info);
@@ -381,7 +390,18 @@ async function collectCodex(
     for (let k = first; k < spends.length; k++) spends[k]!.caller = info.caller;
   }
   readings.sort((a, b) => a.t - b.t);
-  return { spends, readings };
+  return { spends, readings, plans: new Map([...plans].map(([a, p]) => [a, p.plan])) };
+}
+
+/**
+ * The accounts in a window, from its readings and its calls. Each account's
+ * meter is its own series, so with two accounts on one machine their
+ * percentages must not be merged, and an account seen only on calls must not
+ * take the other's rises. Rollouts that predate `creator_account_id` record
+ * none; with a single known account they are taken to be that one.
+ */
+function codexAccounts(readings: Reading[], spends: Spend[] = []): string[] {
+  return [...new Set([...readings.map((r) => r.account), ...spends.map((s) => s.account ?? "")].filter(Boolean))];
 }
 
 /** Fold "repo:mentes-web" into "mentes-ai/mentes-web" when that project shows up elsewhere. */
@@ -454,7 +474,8 @@ interface Report {
   sinceWhy: string;
   model?: string; // --model filter, when given
   total: { cost: number; usd: number; points: number; calls: number };
-  range?: { from: number; to: number }; // codex weekly % across the window
+  range?: { from: number; to: number }; // codex weekly % across the window, one account only
+  accounts?: { id: string; plan: string; range?: { from: number; to: number } }[]; // codex
   groups: { key: string; share: number; cost: number; usd: number; points: number; calls: number; sessions: number }[];
   sessions: {
     id: string;
@@ -482,6 +503,8 @@ function build(
   readings: Reading[],
   history: HistoryEntry[],
   model?: string,
+  plans: Map<string, string> = new Map(),
+  accounts: string[] = [], // codex: the window's accounts, found before any --model filter
 ): Report {
   const metric = (x: { cost: number; points: number }) => (provider === "codex" ? x.points : x.cost);
   const total = { cost: 0, usd: 0, points: 0, calls: spends.length };
@@ -577,11 +600,15 @@ function build(
     const hi = Math.round(Math.max(...vals));
     return lo === hi ? `${lo}%` : `${lo}→${hi}%`;
   };
+  const multi = accounts.length > 1;
   for (const h of report.hours) {
     const inHour = (t: number) => t >= Math.max(h.hour, since) && t < h.hour + 3600e3;
     if (provider === "codex") {
-      const v = readings.filter((r) => inHour(r.t)).map((r) => r.pct);
-      if (v.length) h.readings = `read weekly ${span(v)}`;
+      const parts = (multi ? accounts : [null]).flatMap((a) => {
+        const v = readings.filter((r) => inHour(r.t) && (a === null || r.account === a)).map((r) => r.pct);
+        return v.length ? [a === null ? span(v) : `${plans.get(a) ?? "?"} ${a.slice(0, 8)} ${span(v)}`] : [];
+      });
+      if (parts.length) h.readings = `read weekly ${parts.join(" · ")}`;
     } else {
       const es = history.filter((e) => e.claude && inHour(e.at));
       const five = es.map((e) => e.claude!.fiveHour?.pct).filter((x): x is number => x != null);
@@ -591,8 +618,14 @@ function build(
     }
   }
   if (provider === "codex") {
+    const rangeOf = (rs: Reading[]) => (rs.length ? { from: rs[0]!.pct, to: rs[rs.length - 1]!.pct } : undefined);
     const inWin = readings.filter((r) => r.t >= since);
-    if (inWin.length) report.range = { from: inWin[0]!.pct, to: inWin[inWin.length - 1]!.pct };
+    if (!multi) report.range = rangeOf(inWin);
+    report.accounts = accounts.map((id) => ({
+      id,
+      plan: plans.get(id) ?? "?",
+      range: multi ? rangeOf(inWin.filter((r) => r.account === id)) : report.range,
+    }));
   }
   return report;
 }
@@ -612,14 +645,20 @@ function render(style: Style, r: Report, by: string, timeline: boolean): string[
   const codex = r.provider === "codex";
   const amount = (x: { cost: number; usd: number; points: number }) =>
     (codex ? `${pts(x.points)} · ${usd(x.usd)}` : usd(x.cost)).padStart(codex ? 16 : 6);
-  const weekly = r.range
-    ? `weekly ${Math.round(r.range.from)}→${Math.round(r.range.to)}%, ${pts(r.total.points)} attributed`
-    : "no weekly readings in this window";
+  const pctRange = (x: { from: number; to: number }) => `${Math.round(x.from)}→${Math.round(x.to)}%`;
+  const accts = r.accounts ?? [];
+  const weekly =
+    accts.length > 1
+      ? `${accts.map((a) => `${a.plan} ${a.id.slice(0, 8)} weekly ${a.range ? pctRange(a.range) : "?"}`).join(", ")}, ${pts(r.total.points)} attributed`
+      : r.range
+        ? `weekly ${pctRange(r.range)}, ${pts(r.total.points)} attributed`
+        : "no weekly readings in this window";
+  const title = codex ? (accts.length === 1 ? `Codex (${accts[0]!.plan} · ${accts[0]!.id.slice(0, 8)})` : "Codex") : "Claude";
   const headline = codex
     ? `${weekly} · ${usd(r.total.usd)} at API rates`
     : `${usd(r.total.cost)} at API rates`;
   const lines = [
-    `${style.bold(codex ? "Codex" : "Claude")}  ${style.dim(`· since ${clock(r.since)} (${r.sinceWhy})${r.model ? ` · ${r.model} calls only` : ""} · ${headline} · ${r.total.calls} calls`)}`,
+    `${style.bold(title)}  ${style.dim(`· since ${clock(r.since)} (${r.sinceWhy})${r.model ? ` · ${r.model} calls only` : ""} · ${headline} · ${r.total.calls} calls`)}`,
   ];
   if (!r.total.calls) return [...lines, `  ${style.dim("nothing spent in this window")}`];
 
@@ -703,7 +742,7 @@ async function main() {
   const sessions = new Map<string, SessionInfo>();
   const [claudeAll, codexData, history] = await Promise.all([
     collectClaude(scanFrom, sessions),
-    want("codex") ? collectCodex(scanFrom, sessions) : Promise.resolve({ spends: [], readings: [] }),
+    want("codex") ? collectCodex(scanFrom, sessions) : Promise.resolve({ spends: [], readings: [], plans: new Map() }),
     readHistory(scanFrom),
   ]);
 
@@ -718,7 +757,15 @@ async function main() {
     while (t <= now) t += WEEK_MS;
     return t - WEEK_MS;
   };
-  const codexReset = windowStart(codexData.readings.at(-1)?.resetsAt);
+  // With several accounts, the earliest of their current windows, so none
+  // loses the start of its week.
+  const codexStarts = codexAccounts(codexData.readings).map((a) =>
+    windowStart(codexData.readings.findLast((r) => r.account === a)?.resetsAt),
+  );
+  const codexReset =
+    codexStarts.length > 1
+      ? codexStarts.reduce<number | null>((m, s) => (s !== null && (m === null || s < m) ? s : m), null)
+      : windowStart(codexData.readings.at(-1)?.resetsAt);
   const claudeReset = windowStart([...history].reverse().find((e) => e.claude?.weekly)?.claude?.weekly?.resetsAt);
   const since = (reset: number | null): [number, string] =>
     explicit !== null ? [explicit, `--since ${values.since}`] : reset ? [reset, "weekly window"] : [now - WEEK_MS, "last 7 days"];
@@ -732,10 +779,36 @@ async function main() {
   if (want("codex")) {
     const [from, why] = since(codexReset);
     const spends = [...codexData.spends, ...claudeAll.filter((s) => s.provider === "codex")].filter((s) => s.t >= from);
-    allocatePoints(spends, codexData.readings.filter((r) => r.t >= from));
+    const readings = codexData.readings.filter((r) => r.t >= from);
+    const accounts = codexAccounts(readings, spends);
+    // One meter per account: with several, each account's rises are split
+    // over its own calls only, and calls with no account (gateway, old
+    // rollouts) can't be placed on either meter.
+    if (accounts.length > 1)
+      for (const a of accounts)
+        allocatePoints(
+          spends.filter((s) => s.account === a),
+          readings.filter((r) => r.account === a),
+        );
+    else allocatePoints(spends, readings);
     // Filter after allocating: points are split across every call in a window.
     const kept = spends.filter(ofModel);
-    reports.push(build("codex", kept, sessions, from, why, values.by!, top, codexData.readings, history, values.model));
+    reports.push(
+      build(
+        "codex",
+        kept,
+        sessions,
+        from,
+        why,
+        values.by!,
+        top,
+        codexData.readings,
+        history,
+        values.model,
+        codexData.plans,
+        accounts,
+      ),
+    );
   }
 
   if (values.json) {

@@ -189,6 +189,10 @@ were asked, and the steepest hours.
   (cached input at a tenth, output at four times fresh input). Codex reports
   whole points, which is why a rise is spread back to the last one rather than
   pinned on whatever ran just before the tick.
+  Each rollout also names its ChatGPT account and plan, shown in the header
+  (`Codex (pro · 0c55ea7a)`). With more than one account in the window, each
+  account's meter is its own series: its rises go only to its own turns, and
+  the header lists each account's weekly range.
   An hour's `+N%` is what its turns caused; the `read` note beside it is what
   the snapshots taken in that hour said, which can lag the turns behind them.
   Alongside points, tokens are priced in USD at [OpenAI's standard API rates](https://developers.openai.com/api/docs/pricing)
