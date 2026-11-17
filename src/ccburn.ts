@@ -89,9 +89,11 @@ function codexUsd(model: string, fresh: number, cached: number, output: number, 
   return ((fresh * pr.input + cached * pr.cacheRead) * (long ? 2 : 1) + output * pr.output * (long ? 1.5 : 1)) / 1e6;
 }
 
-// These weights only decide how each weekly rise is split between turns.
-// Keep them independent of API pricing so existing point attribution is stable.
-const codexUnits = (fresh: number, cached: number, output: number) => fresh + 0.1 * cached + 4 * output;
+// These weights only decide how each weekly rise is split between turns. They
+// follow the model's API price: price-blind token weights blamed gpt-6-luna (the
+// $0.10/M tab-title namer) for a fifth of a week that astra and sol spent.
+const codexUnits = (model: string, fresh: number, cached: number, output: number) =>
+  codexUsd(model, fresh, cached, output) * 1e6;
 
 // ------------------------------------------------------------------ records
 
@@ -257,7 +259,7 @@ async function collectClaude(sinceMs: number, sessions: Map<string, SessionInfo>
           session: `claude:${session}`,
           caller: "claude code (gateway)",
           model,
-          cost: codexUnits(input + cacheWrite, cacheRead, output),
+          cost: codexUnits(model, input + cacheWrite, cacheRead, output),
           usd: codexUsd(model, input + cacheWrite, cacheRead, output, input + cacheWrite + cacheRead),
           points: 0,
           tokens,
@@ -370,7 +372,7 @@ async function collectCodex(
               session,
               caller: "",
               model,
-              cost: codexUnits(d.fresh, d.cached, d.output),
+              cost: codexUnits(model, d.fresh, d.cached, d.output),
               usd: codexUsd(model, d.fresh, d.cached, d.output, p.info?.last_token_usage?.input_tokens),
               points: 0,
               tokens: { input: d.fresh, cacheWrite: 0, cacheRead: d.cached, output: d.output },

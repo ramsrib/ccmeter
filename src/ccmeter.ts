@@ -563,9 +563,12 @@ function renderCodex(style: Style, u: CodexUsage): string[] {
 
 const HELP = `ccmeter — subscription usage for Claude and Codex
 
-usage: ccmeter [--json] [--direct] [--no-color]
+usage: ccmeter [--json | --check [--at N]] [--direct] [--no-color]
 
   --json       machine-readable JSON (for scripts / pre-flight quota checks)
+  --check      one line and an exit code: 0 every window under --at (default 85),
+               2 at least one at or over it (Claude 5h, weekly, scoped caps such as
+               Fable; Codex 5h, weekly), 3 a provider could not be read
   --direct     meter your claude.ai login, ignoring ANTHROPIC_* overrides
   --no-color   disable ANSI color
   -h, --help   show this help
@@ -587,6 +590,8 @@ async function main() {
     args: process.argv.slice(2),
     options: {
       json: { type: "boolean", default: false },
+      check: { type: "boolean", default: false },
+      at: { type: "string", default: "85" },
       direct: { type: "boolean", default: false },
       "no-color": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -614,6 +619,32 @@ async function main() {
       : undefined,
     codex: codex.ok ? { capturedAt: codex.capturedAt, fiveHour: codex.fiveHour, weekly: codex.weekly } : undefined,
   });
+
+  if (values.check) {
+    // Pacing rule: an unreadable meter is treated as tight, never as zero usage.
+    const at = Number(values.at);
+    if (!Number.isFinite(at)) throw new Error(`--at wants a number, got ${values.at}`);
+    const tight: string[] = [];
+    const see = (name: string, w?: UsageWindow) => {
+      if (w && w.pct >= at) tight.push(`${name} ${Math.floor(w.pct)}%`);
+    };
+    if (claude.ok) {
+      see("claude 5h", claude.fiveHour);
+      see("claude weekly", claude.weekly);
+      for (const s of claude.scoped ?? []) see(`claude ${s.label}`, s.window);
+    }
+    if (codex.ok) {
+      see("codex 5h", codex.fiveHour);
+      see("codex weekly", codex.weekly);
+    }
+    const unreadable = [!claude.ok && "claude", !codex.ok && "codex"].filter(Boolean);
+    if (unreadable.length) {
+      console.log(`unreadable: ${unreadable.join(", ")}${tight.length ? `; tight: ${tight.join(", ")}` : ""}`);
+      process.exit(3);
+    }
+    console.log(tight.length ? `tight (>= ${at}%): ${tight.join(", ")}` : `ok (all under ${at}%)`);
+    process.exit(tight.length ? 2 : 0);
+  }
 
   if (values.json) {
     console.log(JSON.stringify({ claude, codex, generatedAt: new Date().toISOString() }, null, 2));
