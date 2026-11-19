@@ -29,7 +29,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { readHistory, type HistoryEntry } from "./lib/history.ts";
-import { colorEnabled, makeStyle, type Style } from "./lib/format.ts";
+import { codexPlanLabel, colorEnabled, makeStyle, type Style } from "./lib/format.ts";
 import { jsonlRecursive, readJsonl } from "./lib/walk.ts";
 
 const HOME = homedir();
@@ -610,7 +610,7 @@ function build(
     if (provider === "codex") {
       const parts = (multi ? accounts : [null]).flatMap((a) => {
         const v = readings.filter((r) => inHour(r.t) && (a === null || r.account === a)).map((r) => r.pct);
-        return v.length ? [a === null ? span(v) : `${plans.get(a) ?? "?"} ${a.slice(0, 8)} ${span(v)}`] : [];
+        return v.length ? [a === null ? span(v) : `${codexPlanLabel(plans.get(a)) ?? "?"} ${a.slice(0, 8)} ${span(v)}`] : [];
       });
       if (parts.length) h.readings = `read weekly ${parts.join(" · ")}`;
     } else {
@@ -653,11 +653,11 @@ function render(style: Style, r: Report, by: string, timeline: boolean): string[
   const accts = r.accounts ?? [];
   const weekly =
     accts.length > 1
-      ? `${accts.map((a) => `${a.plan} ${a.id.slice(0, 8)} weekly ${a.range ? pctRange(a.range) : "?"}`).join(", ")}, ${pts(r.total.points)} attributed`
+      ? `${accts.map((a) => `${codexPlanLabel(a.plan)} ${a.id.slice(0, 8)} weekly ${a.range ? pctRange(a.range) : "?"}`).join(", ")}, ${pts(r.total.points)} attributed`
       : r.range
         ? `weekly ${pctRange(r.range)}, ${pts(r.total.points)} attributed`
         : "no weekly readings in this window";
-  const title = codex ? (accts.length === 1 ? `Codex (${accts[0]!.plan} · ${accts[0]!.id.slice(0, 8)})` : "Codex") : "Claude";
+  const title = codex ? (accts.length === 1 ? `Codex (${codexPlanLabel(accts[0]!.plan)} · ${accts[0]!.id.slice(0, 8)})` : "Codex") : "Claude";
   const headline = codex
     ? `${weekly} · ${usd(r.total.usd)} at API rates`
     : `${usd(r.total.cost)} at API rates`;

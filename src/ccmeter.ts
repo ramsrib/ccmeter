@@ -27,6 +27,7 @@ import { appendHistory } from "./lib/history.ts";
 import { jsonlRecursive, readJsonl } from "./lib/walk.ts";
 import {
   bar,
+  codexPlanLabel,
   colorEnabled,
   fmtReset,
   humanAgo,
@@ -547,9 +548,9 @@ function renderClaude(style: Style, u: ClaudeUsage): string[] {
 
 function renderCodex(style: Style, u: CodexUsage): string[] {
   if (!u.ok)
-    return [providerHeader(style, "Codex", u.plan, ""), `  ${style.red(u.error ?? "unavailable")}`];
+    return [providerHeader(style, "Codex", codexPlanLabel(u.plan), ""), `  ${style.red(u.error ?? "unavailable")}`];
   const age = u.live ? "live" : u.capturedAt ? `snapshot ${humanAgo(Date.now() - u.capturedAt)}` : "";
-  const lines = [providerHeader(style, "Codex", u.plan, age)];
+  const lines = [providerHeader(style, "Codex", codexPlanLabel(u.plan), age)];
   // Only draw the windows Codex actually reports. While the 5h cap is suspended
   // (see getCodexUsage), a permanent "5h —" row is noise that reads like a bug in
   // ccmeter rather than an absence upstream. It returns on its own when OpenAI

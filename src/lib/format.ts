@@ -126,3 +126,37 @@ export function money(amount: number, currency: string): string {
     return `${amount.toFixed(2)} ${currency}`;
   }
 }
+
+/**
+ * Codex reports its plan as the ChatGPT backend's id (`chatgpt_plan_type`), e.g.
+ * `self_serve_business_prolite`. Show the name a person would recognise. The ids
+ * are the `PlanType` variants in the Codex CLI (0.169); an id added after that
+ * falls through to its words, so it still reads, just less tidily.
+ */
+const CODEX_PLANS: Record<string, string> = {
+  free: "Free",
+  go: "Go",
+  plus: "Plus",
+  pro: "Pro",
+  prolite: "Pro Lite",
+  promax: "Pro Max",
+  team: "Team",
+  business: "Business",
+  self_serve_business_prolite: "Business Pro Lite",
+  self_serve_business_usage_based: "Business usage-based",
+  enterprise: "Enterprise",
+  ent26: "Enterprise",
+  enterprise_cbp_automation: "Enterprise",
+  enterprise_cbp_usage_based: "Enterprise usage-based",
+  edu: "Edu",
+  education: "Edu",
+  edu_plus: "Edu Plus",
+  edu_pro: "Edu Pro",
+  sci: "Sci",
+  sci_plus: "Sci Plus",
+};
+
+export function codexPlanLabel(plan: string | undefined): string | undefined {
+  if (!plan) return plan;
+  return CODEX_PLANS[plan] ?? plan.replace(/_/g, " ");
+}
