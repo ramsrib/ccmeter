@@ -500,25 +500,29 @@ const GEMINI_TIMEOUT_MS = 20_000;
 /**
  * A login guard for agy. Logged out, or with its login unreadable (the Keychain
  * is locked over ssh), `agy -p /usage` starts a Google sign-in: it runs `open`
- * on an accounts.google.com URL, which pops a browser tab, and then waits for a
- * sign-in nobody will do. agy finds `open` through PATH, so a stub placed first
- * catches that one URL, marks the run and stops agy; anything else goes to the
- * real `open`.
+ * (`xdg-open` on Linux) on an accounts.google.com URL that returns to
+ * antigravity.google, which pops a browser tab, and then waits about a minute
+ * for a sign-in nobody will do. agy finds the opener through PATH, so stubs
+ * placed first catch that one URL, mark the run and stop agy, their parent.
+ * Anything else goes on to the real command.
  */
 function loginGuard(): { dir: string; marker: string } {
   const dir = mkdtempSync(join(tmpdir(), "ccmeter-agy-"));
   const marker = join(dir, "login-required");
-  const stub = join(dir, "open");
-  writeFileSync(
-    stub,
-    `#!/bin/sh
+  for (const opener of ["open", "xdg-open"]) {
+    const stub = join(dir, opener);
+    writeFileSync(
+      stub,
+      `#!/bin/sh
 case "$*" in
-  *accounts.google.com*) : > ${JSON.stringify(marker)}; kill "$PPID" 2>/dev/null; exit 0 ;;
+  *accounts.google.com*antigravity*) : > ${JSON.stringify(marker)}; kill "$PPID" 2>/dev/null; exit 0 ;;
 esac
-exec /usr/bin/open "$@"
+PATH=\${PATH#${JSON.stringify(dir)}:}
+exec "$(basename "$0")" "$@"
 `,
-  );
-  chmodSync(stub, 0o755);
+    );
+    chmodSync(stub, 0o755);
+  }
   return { dir, marker };
 }
 
