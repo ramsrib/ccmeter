@@ -1,6 +1,7 @@
 # ccmeter
 
-Three small tools for people who live in **Claude Code** and **Codex**:
+Three small tools for people who live in **Claude Code** and **Codex** (`ccmeter` also
+meters **Gemini** through the Antigravity CLI):
 
 - **`ccmeter`** — how much of your *subscription* is left (5h window, weekly, credit spend).
 - **`ctxmeter`** — how full the *current session's context window* is, and thus how close
@@ -21,6 +22,10 @@ Claude max  · live
 
 Codex pro  · live
   weekly      9%  █░░░░░░░░░  resets in 6d 9h · 08:25 PM
+
+Gemini  · live
+  5h          6%  █░░░░░░░░░  resets in 4h 5m · 05:56 PM
+  weekly      3%  ░░░░░░░░░░  resets in 5d 22h · 12:21 PM
 ```
 
 **`ctxmeter`** — how full this session's context window is:
@@ -115,6 +120,15 @@ ccmeter --no-color
   it falls back to the most recent rate-limit snapshot Codex wrote to its rollout
   logs (`~/.codex/sessions/**/*.jsonl` and `*.jsonl.zst`), which is only as fresh
   as the last Codex turn on this machine, and says so (`· snapshot 4m ago`).
+- **Gemini** — live, from the Antigravity CLI: `agy --output-format json -p /usage`
+  answers in print mode without starting an agent turn or spending quota. Models
+  in a group share a 5h and a weekly window; the Gemini group always shows, and
+  the Claude/GPT group Antigravity also serves shows once it has been used. The
+  section is left out where `agy` isn't installed. Logged out, or unable to read
+  its login (the macOS Keychain is locked over ssh), `agy` starts a Google sign-in
+  that opens a browser tab and then waits. ccmeter runs it with a stub `open`
+  first on `PATH` that catches that sign-in URL and stops `agy`, and reports
+  Gemini as not logged in instead; `--check` counts it as unreadable.
 
 Every run appends its readings to `~/.local/state/ccmeter/history.jsonl`
 (`$XDG_STATE_HOME` is honoured; `CCMETER_HISTORY` moves the file,

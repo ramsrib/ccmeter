@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * ccmeter — at-a-glance subscription usage for Claude (Code) and Codex.
+ * ccmeter — at-a-glance subscription usage for Claude (Code), Codex and Gemini.
  *
  *   Claude : live, authoritative read of the undocumented OAuth usage endpoint
  *            (GET api.anthropic.com/api/oauth/usage) using the Claude Code
@@ -14,12 +14,17 @@
  *            old, logged out, offline), the most recent rate-limit snapshot
  *            Codex persisted to its rollout logs (~/.codex/sessions/**.jsonl),
  *            which is only as fresh as the last Codex turn on this machine.
+ *   Gemini : live, from the Antigravity CLI's own quota read (`agy -p /usage`
+ *            in print mode: no agent turn, no quota spent). Left out entirely
+ *            where agy isn't installed. agy starts a browser sign-in when it
+ *            can't read its login, so the read runs behind a guard that stops
+ *            it instead (see getGeminiUsage).
  *
  * Flags:  --json   machine-readable output  |  --direct  |  --no-color  |  -h/--help
  */
 import { parseArgs } from "node:util";
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeRouteFromEnv, loadClaudeCreds, routeAuth, type ClaudeRoute } from "./lib/creds.ts";
@@ -84,6 +89,19 @@ interface CodexUsage {
   live?: boolean; // read from OpenAI just now, not a rollout-log snapshot
   fiveHour?: UsageWindow;
   weekly?: UsageWindow;
+}
+
+interface GeminiGroup {
+  name: string; // "Gemini Models", "Claude and GPT models": each has its own pair of windows
+  fiveHour?: UsageWindow;
+  weekly?: UsageWindow;
+}
+
+interface GeminiUsage {
+  ok: boolean;
+  absent?: boolean; // agy not installed: not an error, the section is left out
+  error?: string;
+  groups?: GeminiGroup[];
 }
 
 // ---------------------------------------------------------------- Claude (live)
@@ -474,6 +492,94 @@ async function getCodexSnapshot(): Promise<CodexUsage> {
   return { ok: false, error: "no rate-limit snapshot yet — run codex once" };
 }
 
+// ----------------------------------------------------------------- Gemini (live)
+
+// `agy -p /usage` answers from the CLI's own quota read; a cold start is a few seconds.
+const GEMINI_TIMEOUT_MS = 20_000;
+
+/**
+ * A login guard for agy. Logged out, or with its login unreadable (the Keychain
+ * is locked over ssh), `agy -p /usage` starts a Google sign-in: it runs `open`
+ * on an accounts.google.com URL, which pops a browser tab, and then waits for a
+ * sign-in nobody will do. agy finds `open` through PATH, so a stub placed first
+ * catches that one URL, marks the run and stops agy; anything else goes to the
+ * real `open`.
+ */
+function loginGuard(): { dir: string; marker: string } {
+  const dir = mkdtempSync(join(tmpdir(), "ccmeter-agy-"));
+  const marker = join(dir, "login-required");
+  const stub = join(dir, "open");
+  writeFileSync(
+    stub,
+    `#!/bin/sh
+case "$*" in
+  *accounts.google.com*) : > ${JSON.stringify(marker)}; kill "$PPID" 2>/dev/null; exit 0 ;;
+esac
+exec /usr/bin/open "$@"
+`,
+  );
+  chmodSync(stub, 0o755);
+  return { dir, marker };
+}
+
+/** One `agy` bucket ({window, remaining_fraction, reset_time}) as a used-percent window. */
+function geminiWindow(b: any): UsageWindow | undefined {
+  if (!b || typeof b.remaining_fraction !== "number") return undefined;
+  const reset = typeof b.reset_time === "string" ? Date.parse(b.reset_time) : NaN;
+  // An untouched bucket reports the epoch: nothing to reset.
+  return { pct: Math.max(0, (1 - b.remaining_fraction) * 100), resetsAt: Number.isFinite(reset) && reset > 0 ? reset : null };
+}
+
+function getGeminiUsage(): Promise<GeminiUsage> {
+  return new Promise((resolve) => {
+    const guard = loginGuard();
+    let out = "";
+    let settled = false;
+    let child: ReturnType<typeof spawn>;
+    const finish = (u: GeminiUsage) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child?.kill();
+      if (existsSync(guard.marker)) u = { ok: false, error: "agy is not logged in (or can't read its login here): run agy once to sign in" };
+      rmSync(guard.dir, { recursive: true, force: true });
+      resolve(u);
+    };
+    const timer = setTimeout(() => finish({ ok: false, error: "agy did not answer /usage in time" }), GEMINI_TIMEOUT_MS);
+    try {
+      child = spawn("agy", ["--output-format", "json", "-p=/usage"], {
+        cwd: tmpdir(),
+        env: { ...process.env, PATH: `${guard.dir}:${process.env.PATH ?? ""}` },
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      return finish({ ok: false, absent: true });
+    }
+    child.on("error", (e: NodeJS.ErrnoException) =>
+      finish(e.code === "ENOENT" ? { ok: false, absent: true } : { ok: false, error: e.message }),
+    );
+    child.stdout?.on("data", (c: Buffer) => (out += c.toString("utf8")));
+    child.on("exit", () => {
+      let d: any;
+      try {
+        d = JSON.parse(out);
+      } catch {
+        return finish({ ok: false, error: "agy /usage gave no JSON" });
+      }
+      if (d?.status !== "SUCCESS")
+        return finish({ ok: false, error: `agy /usage: ${String(d?.error || d?.status || "failed").split("\n")[0]}` });
+      const groups: GeminiGroup[] = [];
+      for (const g of Array.isArray(d.command?.data?.groups) ? d.command.data.groups : []) {
+        const buckets = Array.isArray(g?.buckets) ? g.buckets : [];
+        const by = (w: string) => geminiWindow(buckets.find((b: any) => b?.window === w));
+        const group = { name: String(g?.name ?? "?"), fiveHour: by("5h"), weekly: by("weekly") };
+        if (group.fiveHour || group.weekly) groups.push(group);
+      }
+      finish(groups.length ? { ok: true, groups } : { ok: false, error: "agy /usage listed no quota windows" });
+    });
+  });
+}
+
 // ---------------------------------------------------------------------- rendering
 
 // Wide enough for "credits" and for a tree-prefixed model name ("└ Sonnet");
@@ -562,14 +668,34 @@ function renderCodex(style: Style, u: CodexUsage): string[] {
   return lines;
 }
 
-const HELP = `ccmeter — subscription usage for Claude and Codex
+/**
+ * The Gemini group first, as "5h" / "weekly". Any other group (Antigravity also
+ * serves Claude and GPT models from a separate pool) shows only once it has
+ * been used, labelled by its name.
+ */
+function renderGemini(style: Style, u: GeminiUsage): string[] {
+  if (!u.ok) return [providerHeader(style, "Gemini", undefined, ""), `  ${style.red(u.error ?? "unavailable")}`];
+  const lines = [providerHeader(style, "Gemini", undefined, "live")];
+  for (const g of u.groups ?? []) {
+    const main = /^gemini/i.test(g.name);
+    const used = (g.fiveHour?.pct ?? 0) > 0 || (g.weekly?.pct ?? 0) > 0;
+    if (!main && !used) continue;
+    if (!main) lines.push(`  ${style.dim(g.name)}`);
+    if (g.fiveHour) lines.push(windowRow(style, main ? "5h" : "└ 5h", g.fiveHour));
+    if (g.weekly) lines.push(windowRow(style, main ? "weekly" : "└ weekly", g.weekly));
+  }
+  return lines;
+}
+
+const HELP = `ccmeter — subscription usage for Claude, Codex and Gemini
 
 usage: ccmeter [--json | --check [--at N]] [--direct] [--no-color]
 
   --json       machine-readable JSON (for scripts / pre-flight quota checks)
   --check      one line and an exit code: 0 every window under --at (default 85),
                2 at least one at or over it (Claude 5h, weekly, scoped caps such as
-               Fable; Codex 5h, weekly), 3 a provider could not be read
+               Fable; Codex 5h, weekly; Gemini's windows), 3 a provider could not be
+               read (Gemini counts only where agy is installed)
   --direct     meter your claude.ai login, ignoring ANTHROPIC_* overrides
   --no-color   disable ANSI color
   -h, --help   show this help
@@ -584,7 +710,11 @@ Each run appends its readings to ~/.local/state/ccmeter/history.jsonl
 reads it to show how the windows moved.
 Codex numbers are a live read from a short-lived \`codex app-server\`
 (account/rateLimits/read). If that fails, they are the latest snapshot
-from ~/.codex rollout logs (as fresh as your last Codex turn).`;
+from ~/.codex rollout logs (as fresh as your last Codex turn).
+Gemini numbers come from the Antigravity CLI (\`agy -p /usage\`), which
+spends no quota; the section is left out where agy isn't installed. If agy
+can't read its login, ccmeter stops its sign-in attempt rather than let it
+open a browser, and reports Gemini as unreadable.`;
 
 async function main() {
   const { values } = parseArgs({
@@ -605,7 +735,7 @@ async function main() {
     return;
   }
 
-  const [claude, codex] = await Promise.all([getClaudeUsage(values.direct), getCodexUsage()]);
+  const [claude, codex, gemini] = await Promise.all([getClaudeUsage(values.direct), getCodexUsage(), getGeminiUsage()]);
   await appendHistory({
     at: Date.now(),
     claude: claude.ok
@@ -619,6 +749,7 @@ async function main() {
         }
       : undefined,
     codex: codex.ok ? { capturedAt: codex.capturedAt, fiveHour: codex.fiveHour, weekly: codex.weekly } : undefined,
+    gemini: gemini.ok ? { groups: gemini.groups } : undefined,
   });
 
   if (values.check) {
@@ -638,7 +769,12 @@ async function main() {
       see("codex 5h", codex.fiveHour);
       see("codex weekly", codex.weekly);
     }
-    const unreadable = [!claude.ok && "claude", !codex.ok && "codex"].filter(Boolean);
+    for (const g of gemini.groups ?? []) {
+      const name = /^gemini/i.test(g.name) ? "gemini" : `gemini ${g.name}`;
+      see(`${name} 5h`, g.fiveHour);
+      see(`${name} weekly`, g.weekly);
+    }
+    const unreadable = [!claude.ok && "claude", !codex.ok && "codex", !gemini.ok && !gemini.absent && "gemini"].filter(Boolean);
     if (unreadable.length) {
       console.log(`unreadable: ${unreadable.join(", ")}${tight.length ? `; tight: ${tight.join(", ")}` : ""}`);
       process.exit(3);
@@ -648,13 +784,14 @@ async function main() {
   }
 
   if (values.json) {
-    console.log(JSON.stringify({ claude, codex, generatedAt: new Date().toISOString() }, null, 2));
+    console.log(JSON.stringify({ claude, codex, ...(gemini.absent ? {} : { gemini }), generatedAt: new Date().toISOString() }, null, 2));
     process.exit(claude.ok || codex.ok ? 0 : 1);
   }
 
   const enabled = values["no-color"] ? false : colorEnabled();
   const style = makeStyle(enabled);
   const out = [...renderClaude(style, claude), "", ...renderCodex(style, codex)];
+  if (!gemini.absent) out.push("", ...renderGemini(style, gemini));
   console.log(out.join("\n"));
   process.exit(claude.ok || codex.ok ? 0 : 1);
 }

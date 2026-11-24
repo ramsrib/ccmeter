@@ -34,6 +34,10 @@ export interface HistoryEntry {
     fiveHour?: HistoryWindow;
     weekly?: HistoryWindow;
   };
+  // Antigravity (agy): one pair of windows per model group.
+  gemini?: {
+    groups?: { name: string; fiveHour?: HistoryWindow; weekly?: HistoryWindow }[];
+  };
 }
 
 // Plenty for a month of readings every few minutes. Past it, drop what's older
