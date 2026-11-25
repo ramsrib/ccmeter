@@ -249,7 +249,7 @@ bin/ccmeter        sh shim: exec bun (preferred) or node against src/
 bin/ctxmeter
 bin/ccburn
 src/
-  lib/creds.ts     locate Claude / Codex credentials (keychain, ~/.claude, ~/.codex)
+  lib/creds.ts     locate Claude / Codex / agy credentials (keychain, ~/.claude, ~/.codex)
   lib/format.ts    color, utilization bars, percent / reset-time / money formatting
   lib/history.ts   the readings log ccmeter appends and ccburn reads
   lib/walk.ts      find/read *.jsonl and *.jsonl.zst (no bun Glob, so node works too)
