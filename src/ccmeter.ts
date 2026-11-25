@@ -8,9 +8,10 @@
  *            utilization and, when enabled, extra-usage credit spend.
  *            When ANTHROPIC_BASE_URL routes Claude Code through a gateway, it
  *            meters that route instead (see getGatewayUsage).
- *   Codex  : live, by asking a short-lived `codex app-server` for
- *            account/rateLimits/read (the numbers the TUI `/status` shows,
- *            fetched from OpenAI now). When that fails (codex missing or too
+ *   Codex  : live, account/rateLimits/read (the numbers the TUI `/status`
+ *            shows, fetched from OpenAI now): from the managed app-server daemon
+ *            when one is running (its socket, no process to start), else from a
+ *            short-lived `codex app-server`. When both fail (codex missing or too
  *            old, logged out, offline), the most recent rate-limit snapshot
  *            Codex persisted to its rollout logs (~/.codex/sessions/**.jsonl),
  *            which is only as fresh as the last Codex turn on this machine.
@@ -31,6 +32,8 @@
 import { VERSION } from "./lib/version.ts";
 import { parseArgs } from "node:util";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { createConnection } from "node:net";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -330,6 +333,133 @@ function bucketCodexWindows(windows: ({ mins: number; window: UsageWindow } | nu
 }
 
 /**
+ * The account/rateLimits/read result as usage, or null when it is off-shape (the
+ * caller then falls back rather than showing a wrong number as live).
+ */
+function codexRateLimits(result: any): CodexUsage | null {
+  // The account-wide budget is limit id "codex"; model-scoped caps ride alongside,
+  // and the top-level rateLimits counts only when it is that same budget.
+  let rl = result?.rateLimitsByLimitId?.codex;
+  const top = result?.rateLimits;
+  if (!rl && top && (top.limitId == null || top.limitId === "codex")) rl = top;
+  const valid = (w: any) =>
+    w == null || (typeof w === "object" && typeof w.usedPercent === "number" && typeof w.windowDurationMins === "number");
+  if (!rl || typeof rl !== "object" || !valid(rl.primary) || !valid(rl.secondary) || (!rl.primary && !rl.secondary))
+    return null;
+  const win = (w: any) =>
+    w
+      ? {
+          mins: w.windowDurationMins,
+          window: { pct: w.usedPercent, resetsAt: typeof w.resetsAt === "number" ? w.resetsAt * 1000 : null },
+        }
+      : null;
+  const { fiveHour, weekly } = bucketCodexWindows([win(rl.primary), win(rl.secondary)]);
+  return { ok: true, live: true, plan: rl.planType ?? undefined, capturedAt: Date.now(), fiveHour, weekly };
+}
+
+const CODEX_DAEMON_SOCKET = join(homedir(), ".codex", "app-server-control", "app-server-control.sock");
+// A running daemon answers initialize in ~1 ms; the read itself is OpenAI's round trip.
+const CODEX_DAEMON_TIMEOUT_MS = 5_000;
+
+/**
+ * Ask the managed app-server daemon (`codex app-server daemon start|bootstrap`),
+ * when one is running: the same JSON-RPC as a spawned app-server, carried in
+ * WebSocket text frames over its unix socket (an HTTP/1.1 upgrade on GET /).
+ * Saves starting a process per run. A minimal client, enough for two requests:
+ * masked text frames out; unmasked, unfragmented text frames in, others ignored.
+ * Resolves null on anything unexpected so the caller can spawn one instead.
+ */
+function getCodexDaemon(): Promise<CodexUsage | null> {
+  return new Promise((resolve) => {
+    if (!existsSync(CODEX_DAEMON_SOCKET)) return resolve(null);
+    let settled = false;
+    let upgraded = false;
+    let buf = Buffer.alloc(0);
+    const sock = createConnection({ path: CODEX_DAEMON_SOCKET });
+    const finish = (u: CodexUsage | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      sock.destroy();
+      resolve(u);
+    };
+    const timer = setTimeout(() => finish(null), CODEX_DAEMON_TIMEOUT_MS);
+    sock.on("error", () => finish(null));
+    sock.on("close", () => finish(null));
+    const send = (m: object) => {
+      const data = Buffer.from(JSON.stringify(m));
+      let head: Buffer;
+      if (data.length < 126) head = Buffer.from([0x81, 0x80 | data.length]);
+      else if (data.length < 65536) {
+        head = Buffer.alloc(4);
+        head[0] = 0x81;
+        head[1] = 0x80 | 126;
+        head.writeUInt16BE(data.length, 2);
+      } else return finish(null);
+      const mask = randomBytes(4);
+      const body = Buffer.alloc(data.length);
+      for (let i = 0; i < data.length; i++) body[i] = data[i] ^ mask[i % 4];
+      sock.write(Buffer.concat([head, mask, body]));
+    };
+    const onMessage = (m: any) => {
+      if (!m || typeof m !== "object") return;
+      if (m.id === 1) {
+        if (!m.result) return finish(null);
+        send({ method: "initialized" });
+        send({ id: 2, method: "account/rateLimits/read", params: {} });
+      } else if (m.id === 2) {
+        finish(codexRateLimits(m.result));
+      }
+    };
+    sock.on("connect", () => {
+      sock.write(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+          `Sec-WebSocket-Key: ${randomBytes(16).toString("base64")}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+      );
+    });
+    sock.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (!upgraded) {
+        const end = buf.indexOf("\r\n\r\n");
+        if (end < 0) return;
+        if (!/^HTTP\/1\.1 101 /.test(buf.subarray(0, end).toString("latin1"))) return finish(null);
+        upgraded = true;
+        buf = buf.subarray(end + 4);
+        send({ id: 1, method: "initialize", params: { clientInfo: { name: "ccmeter", version: VERSION } } });
+      }
+      for (;;) {
+        if (buf.length < 2) return;
+        const fin = (buf[0] & 0x80) !== 0;
+        const op = buf[0] & 0x0f;
+        if (buf[1] & 0x80) return finish(null); // a server never masks
+        let n = buf[1] & 0x7f;
+        let off = 2;
+        if (n === 126) {
+          if (buf.length < 4) return;
+          n = buf.readUInt16BE(2);
+          off = 4;
+        } else if (n === 127) {
+          if (buf.length < 10) return;
+          n = Number(buf.readBigUInt64BE(2));
+          off = 10;
+        }
+        if (buf.length < off + n) return;
+        const payload = buf.subarray(off, off + n);
+        buf = buf.subarray(off + n);
+        if (op === 0x8) return finish(null); // close
+        if (op !== 0x1) continue; // ping, pong, binary: not ours to answer here
+        if (!fin) return finish(null); // fragmented: not worth handling, spawn instead
+        try {
+          onMessage(JSON.parse(payload.toString("utf8")));
+        } catch {
+          // a notification we can't parse is not our reply
+        }
+      }
+    });
+  });
+}
+
+/**
  * Ask Codex itself, live: start `codex app-server` (its JSON-RPC mode for other
  * programs, newline-delimited over stdio), send initialize + account/rateLimits/read,
  * and close it. Nothing has to be running already. Resolves null on any failure,
@@ -388,33 +518,20 @@ function getCodexLive(): Promise<CodexUsage | null> {
           send({ method: "initialized" });
           send({ id: 2, method: "account/rateLimits/read", params: {} });
         } else if (m.id === 2) {
-          // The account-wide budget is limit id "codex"; model-scoped caps ride alongside,
-          // and the top-level rateLimits counts only when it is that same budget.
-          let rl = m.result?.rateLimitsByLimitId?.codex;
-          const top = m.result?.rateLimits;
-          if (!rl && top && (top.limitId == null || top.limitId === "codex")) rl = top;
-          const valid = (w: any) =>
-            w == null || (typeof w === "object" && typeof w.usedPercent === "number" && typeof w.windowDurationMins === "number");
           // Anything off-shape falls back to the snapshot rather than showing as live.
-          if (!rl || typeof rl !== "object" || !valid(rl.primary) || !valid(rl.secondary) || (!rl.primary && !rl.secondary))
-            return finish(null);
-          const win = (w: any) =>
-            w
-              ? {
-                  mins: w.windowDurationMins,
-                  window: { pct: w.usedPercent, resetsAt: typeof w.resetsAt === "number" ? w.resetsAt * 1000 : null },
-                }
-              : null;
-          const { fiveHour, weekly } = bucketCodexWindows([win(rl.primary), win(rl.secondary)]);
-          finish({ ok: true, live: true, plan: rl.planType ?? undefined, capturedAt: Date.now(), fiveHour, weekly });
+          finish(codexRateLimits(m.result));
         }
       }
     });
-    send({ id: 1, method: "initialize", params: { clientInfo: { name: "ccmeter", version: "0" } } });
+    send({ id: 1, method: "initialize", params: { clientInfo: { name: "ccmeter", version: VERSION } } });
   });
 }
 
 async function getCodexUsage(): Promise<CodexUsage> {
+  if (process.env.CCMETER_CODEX_DAEMON !== "0") {
+    const d = await getCodexDaemon();
+    if (d) return d;
+  }
   return (await getCodexLive()) ?? getCodexSnapshot();
 }
 
@@ -850,8 +967,9 @@ the rate-limit headers on a one-token probe sent through that gateway
 Each run appends its readings to ~/.local/state/ccmeter/history.jsonl
 (CCMETER_HISTORY moves it, CCMETER_NO_HISTORY=1 turns it off); ccburn
 reads it to show how the windows moved.
-Codex numbers are a live read from a short-lived \`codex app-server\`
-(account/rateLimits/read). If that fails, they are the latest snapshot
+Codex numbers are a live read of account/rateLimits/read, from the running
+app-server daemon's socket when there is one, else from a short-lived
+\`codex app-server\`. If that fails, they are the latest snapshot
 from ~/.codex rollout logs (as fresh as your last Codex turn).
 Gemini numbers are a live read of the quota endpoint the Antigravity CLI
 (agy) uses, with agy's token from the Keychain. When that token is missing or

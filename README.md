@@ -113,9 +113,12 @@ ccmeter --no-color
   picks for the probe, which may not be the account a given session is pinned
   to. Claude Code itself tracks no limits under a third-party token, so behind a
   gateway ccmeter is the only view.
-- **Codex** — live: ccmeter starts a short-lived `codex app-server` (Codex's
-  JSON-RPC mode for other programs) and asks it for `account/rateLimits/read`, the
-  numbers the TUI `/status` shows, fetched from OpenAI now. Nothing has to be
+- **Codex** — live: ccmeter asks Codex's app-server for `account/rateLimits/read`,
+  the numbers the TUI `/status` shows, fetched from OpenAI now. When the managed
+  daemon is running (`codex app-server daemon start` / `bootstrap`), it asks that one
+  over its socket (`~/.codex/app-server-control/app-server-control.sock`, JSON-RPC in
+  WebSocket frames), so no process starts; otherwise it starts a short-lived
+  `codex app-server` (Codex's JSON-RPC mode for other programs). Nothing has to be
   running already. If that fails (codex missing or too old, logged out, offline),
   it falls back to the most recent rate-limit snapshot Codex wrote to its rollout
   logs (`~/.codex/sessions/**/*.jsonl` and `*.jsonl.zst`), which is only as fresh
