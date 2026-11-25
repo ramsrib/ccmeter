@@ -18,6 +18,7 @@
  *
  * Flags: --json | --limit N | --threshold N (exit 1 at/above N%) | --transcript P
  */
+import { VERSION } from "./lib/version.ts";
 import { parseArgs } from "node:util";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -221,6 +222,7 @@ usage: ctxmeter [--all] [--session ID] [--transcript PATH] [--json]
   --threshold N  exit 1 when usage is at/above N% (for hooks and guards)
   --no-color     disable ANSI color
   -h, --help     show this help
+  -V, --version  print the version
 
 Run inside a session (reads $CLAUDE_CODE_SESSION_ID) or from a hook (--transcript).
 From a plain terminal neither exists, so it falls back to the newest transcript for
@@ -254,12 +256,17 @@ async function main() {
       all: { type: "boolean", default: false },
       since: { type: "string" },
       help: { type: "boolean", short: "h", default: false },
+      version: { type: "boolean", short: "V", default: false },
     },
     allowPositionals: false,
   });
 
   if (values.help) {
     console.log(HELP);
+    return;
+  }
+  if (values.version) {
+    console.log(`ctxmeter ${VERSION}`);
     return;
   }
 

@@ -28,6 +28,7 @@
  *
  * Flags:  --json   machine-readable output  |  --direct  |  --no-color  |  -h/--help
  */
+import { VERSION } from "./lib/version.ts";
 import { parseArgs } from "node:util";
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -839,6 +840,7 @@ usage: ccmeter [--json | --check [--at N]] [--direct] [--no-color]
   --direct     meter your claude.ai login, ignoring ANTHROPIC_* overrides
   --no-color   disable ANSI color
   -h, --help   show this help
+  -V, --version  print the version
 
 Claude numbers are a live read of the OAuth usage endpoint. When
 ANTHROPIC_BASE_URL routes Claude Code through a gateway, they come from
@@ -871,6 +873,7 @@ async function main() {
       direct: { type: "boolean", default: false },
       "no-color": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
+      version: { type: "boolean", short: "V", default: false },
       "refresh-gemini": { type: "boolean", default: false }, // internal: the background refresh
     },
     allowPositionals: false,
@@ -878,6 +881,10 @@ async function main() {
 
   if (values.help) {
     console.log(HELP);
+    return;
+  }
+  if (values.version) {
+    console.log(`ccmeter ${VERSION}`);
     return;
   }
   if (values["refresh-gemini"]) {

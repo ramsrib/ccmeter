@@ -23,6 +23,7 @@
  * Flags:  --since 6h|2d|ISO  --by project|model|caller  --model NAME  --top N  --timeline
  *         --claude | --codex  --json  --no-color  -h/--help
  */
+import { VERSION } from "./lib/version.ts";
 import { parseArgs } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -704,6 +705,7 @@ usage: ccburn [--since 6h|2d|1w|DATE] [--by project|model|caller] [--model NAME]
   --timeline   every hour, instead of the five steepest
   --claude, --codex   one provider only
   --json       machine-readable
+  -V, --version   print the version
 
 Claude spend is priced at Anthropic's API rates from local transcripts: an
 estimate of the share, not the subscription's own accounting. Codex spend is in
@@ -727,10 +729,15 @@ async function main() {
       json: { type: "boolean", default: false },
       "no-color": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
+      version: { type: "boolean", short: "V", default: false },
     },
     allowPositionals: false,
   });
   if (values.help) return console.log(HELP);
+  if (values.version) {
+    console.log(`ccburn ${VERSION}`);
+    return;
+  }
   if (!["project", "model", "caller"].includes(values.by!)) throw new Error(`--by: expected project, model or caller`);
   const top = Math.max(1, Number(values.top) || 8);
   const want = (p: Provider) => (!values.claude && !values.codex) || values[p];
