@@ -27,7 +27,7 @@
  *            runs behind a guard that stops it instead. Left out entirely where
  *            neither agy nor its token exists.
  *
- * Flags:  --json   machine-readable output  |  --direct  |  --no-color  |  -h/--help
+ * Flags:  --claude | --codex | --gemini  |  --json  |  --check  |  --direct  |  --no-color  |  -h/--help
  */
 import { VERSION } from "./lib/version.ts";
 import { parseArgs } from "node:util";
@@ -932,7 +932,8 @@ function renderCodex(style: Style, u: CodexUsage): string[] {
  */
 function renderGemini(style: Style, u: GeminiUsage): string[] {
   const age = u.live || !u.capturedAt ? "live" : `read ${humanAgo(Date.now() - u.capturedAt)}`;
-  if (!u.ok) return [providerHeader(style, "Gemini", undefined, u.live ? "" : age), `  ${style.red(u.error ?? "unavailable")}`];
+  // An error carries an age only when it is a cached reading of one.
+  if (!u.ok) return [providerHeader(style, "Gemini", undefined, !u.live && u.capturedAt ? age : ""), `  ${style.red(u.error ?? "unavailable")}`];
   const lines = [providerHeader(style, "Gemini", undefined, age)];
   for (const g of u.groups ?? []) {
     const main = /^gemini/i.test(g.name);
@@ -947,13 +948,19 @@ function renderGemini(style: Style, u: GeminiUsage): string[] {
 
 const HELP = `ccmeter — subscription usage for Claude, Codex and Gemini
 
-usage: ccmeter [--json | --check [--at N]] [--direct] [--no-color]
+usage: ccmeter [--claude] [--codex] [--gemini] [--json | --check [--at N]]
+               [--direct] [--no-color]
+
+  --claude, --codex, --gemini
+               only these providers (any combination; default: all). The
+               others aren't read, so a run waits on fewer servers
 
   --json       machine-readable JSON (for scripts / pre-flight quota checks)
   --check      one line and an exit code: 0 every window under --at (default 85),
                2 at least one at or over it (Claude 5h, weekly, scoped caps such as
                Fable; Codex 5h, weekly; Gemini's windows), 3 a provider could not be
-               read (Gemini counts only where agy is installed)
+               read (Gemini counts only where agy is installed); only the
+               picked providers count
   --direct     meter your claude.ai login, ignoring ANTHROPIC_* overrides
   --no-color   disable ANSI color
   -h, --help   show this help
@@ -989,6 +996,9 @@ async function main() {
       check: { type: "boolean", default: false },
       at: { type: "string", default: "85" },
       direct: { type: "boolean", default: false },
+      claude: { type: "boolean", default: false },
+      codex: { type: "boolean", default: false },
+      gemini: { type: "boolean", default: false },
       "no-color": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "V", default: false },
@@ -1011,10 +1021,21 @@ async function main() {
     return;
   }
 
-  const [claude, codex, gemini] = await Promise.all([getClaudeUsage(values.direct), getCodexUsage(), getGemini()]);
+  // --claude / --codex / --gemini pick providers (any combination); none means all.
+  // An unpicked provider isn't read at all, so its server isn't waited on.
+  const picked = (["claude", "codex", "gemini"] as const).filter((p) => values[p]);
+  const want = (p: (typeof picked)[number]) => picked.length === 0 || picked.includes(p);
+  const [claude, codex, gemini0] = await Promise.all([
+    want("claude") ? getClaudeUsage(values.direct) : null,
+    want("codex") ? getCodexUsage() : null,
+    want("gemini") ? getGemini() : null,
+  ]);
+  // Asked for by name, a missing agy is an answer, not a section to leave out.
+  const gemini: GeminiUsage | null =
+    gemini0?.absent && values.gemini ? { ok: false, error: "agy (the Antigravity CLI) is not installed here" } : gemini0;
   await appendHistory({
     at: Date.now(),
-    claude: claude.ok
+    claude: claude?.ok
       ? {
           route: claude.route,
           plan: claude.plan,
@@ -1024,9 +1045,10 @@ async function main() {
           credits: claude.credits,
         }
       : undefined,
-    codex: codex.ok ? { capturedAt: codex.capturedAt, fiveHour: codex.fiveHour, weekly: codex.weekly } : undefined,
-    gemini: gemini.ok ? { capturedAt: gemini.capturedAt, groups: gemini.groups } : undefined,
+    codex: codex?.ok ? { capturedAt: codex.capturedAt, fiveHour: codex.fiveHour, weekly: codex.weekly } : undefined,
+    gemini: gemini?.ok ? { capturedAt: gemini.capturedAt, groups: gemini.groups } : undefined,
   });
+  const anyRead = [claude, codex, gemini].some((u) => u?.ok);
 
   if (values.check) {
     // Pacing rule: an unreadable meter is treated as tight, never as zero usage.
@@ -1036,21 +1058,25 @@ async function main() {
     const see = (name: string, w?: UsageWindow) => {
       if (w && w.pct >= at) tight.push(`${name} ${Math.floor(w.pct)}%`);
     };
-    if (claude.ok) {
+    if (claude?.ok) {
       see("claude 5h", claude.fiveHour);
       see("claude weekly", claude.weekly);
       for (const s of claude.scoped ?? []) see(`claude ${s.label}`, s.window);
     }
-    if (codex.ok) {
+    if (codex?.ok) {
       see("codex 5h", codex.fiveHour);
       see("codex weekly", codex.weekly);
     }
-    for (const g of gemini.groups ?? []) {
+    for (const g of gemini?.groups ?? []) {
       const name = /^gemini/i.test(g.name) ? "gemini" : `gemini ${g.name}`;
       see(`${name} 5h`, g.fiveHour);
       see(`${name} weekly`, g.weekly);
     }
-    const unreadable = [!claude.ok && "claude", !codex.ok && "codex", !gemini.ok && !gemini.absent && "gemini"].filter(Boolean);
+    const unreadable = [
+      claude && !claude.ok && "claude",
+      codex && !codex.ok && "codex",
+      gemini && !gemini.ok && !gemini.absent && "gemini",
+    ].filter(Boolean);
     if (unreadable.length) {
       console.log(`unreadable: ${unreadable.join(", ")}${tight.length ? `; tight: ${tight.join(", ")}` : ""}`);
       process.exit(3);
@@ -1060,16 +1086,24 @@ async function main() {
   }
 
   if (values.json) {
-    console.log(JSON.stringify({ claude, codex, ...(gemini.absent ? {} : { gemini }), generatedAt: new Date().toISOString() }, null, 2));
-    process.exit(claude.ok || codex.ok ? 0 : 1);
+    const out = {
+      ...(claude ? { claude } : {}),
+      ...(codex ? { codex } : {}),
+      ...(gemini && !gemini.absent ? { gemini } : {}),
+      generatedAt: new Date().toISOString(),
+    };
+    console.log(JSON.stringify(out, null, 2));
+    process.exit(anyRead ? 0 : 1);
   }
 
   const enabled = values["no-color"] ? false : colorEnabled();
   const style = makeStyle(enabled);
-  const out = [...renderClaude(style, claude), "", ...renderCodex(style, codex)];
-  if (!gemini.absent) out.push("", ...renderGemini(style, gemini));
-  console.log(out.join("\n"));
-  process.exit(claude.ok || codex.ok ? 0 : 1);
+  const blocks: string[][] = [];
+  if (claude) blocks.push(renderClaude(style, claude));
+  if (codex) blocks.push(renderCodex(style, codex));
+  if (gemini && !gemini.absent) blocks.push(renderGemini(style, gemini));
+  console.log(blocks.map((b) => b.join("\n")).join("\n\n"));
+  process.exit(anyRead ? 0 : 1);
 }
 
 main().catch((e) => {

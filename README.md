@@ -76,6 +76,7 @@ stripping. That means the source must stay erasable-only: no `enum`, no
 
 ```sh
 ccmeter              # colored summary
+ccmeter --claude     # one provider (--claude, --codex, --gemini; combine any)
 ccmeter --json       # machine-readable (scripts, pre-flight quota checks)
 ccmeter --check      # one line; exit 0 fine, 2 a window >= 85% (--at N), 3 unreadable
 ccmeter --direct     # your claude.ai login, even inside a gateway-routed session
