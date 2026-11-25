@@ -14,12 +14,17 @@
  *            old, logged out, offline), the most recent rate-limit snapshot
  *            Codex persisted to its rollout logs (~/.codex/sessions/**.jsonl),
  *            which is only as fresh as the last Codex turn on this machine.
- *   Gemini : from the Antigravity CLI's own quota read (`agy -p /usage` in
- *            print mode: no agent turn, no quota spent). Left out entirely
- *            where agy isn't installed. agy takes ~3 s to start, so the last
- *            reading is shown at once and refreshed in the background (see
- *            getGemini). agy starts a browser sign-in when it can't read its
- *            login, so the read runs behind a guard that stops it instead.
+ *   Gemini : live, from the endpoint the Antigravity CLI (agy) reads its own
+ *            quota from (POST daily-cloudcode-pa.googleapis.com/v1internal:
+ *            retrieveUserQuotaSummary) with agy's token from the Keychain. When
+ *            that can't be used (token absent or about to expire, a refused
+ *            call), agy itself: `agy -p /usage` in print mode, no agent turn
+ *            and no quota spent. agy takes ~3 s to start, so that path shows
+ *            the last reading at once and refreshes it in the background (see
+ *            getGemini); it also refreshes agy's token for the next direct read.
+ *            agy starts a browser sign-in when it can't read its login, so it
+ *            runs behind a guard that stops it instead. Left out entirely where
+ *            neither agy nor its token exists.
  *
  * Flags:  --json   machine-readable output  |  --direct  |  --no-color  |  -h/--help
  */
@@ -28,7 +33,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { claudeRouteFromEnv, loadClaudeCreds, routeAuth, type ClaudeRoute } from "./lib/creds.ts";
+import { claudeRouteFromEnv, loadAgyToken, loadClaudeCreds, routeAuth, type ClaudeRoute } from "./lib/creds.ts";
 import { appendHistory } from "./lib/history.ts";
 import { jsonlRecursive, readJsonl } from "./lib/walk.ts";
 import {
@@ -103,8 +108,9 @@ interface GeminiUsage {
   absent?: boolean; // agy not installed: not an error, the section is left out
   error?: string;
   groups?: GeminiGroup[];
-  capturedAt?: number; // epoch ms of the agy read
+  capturedAt?: number; // epoch ms of the read
   live?: boolean; // read during this run, not the cached reading
+  via?: "api" | "agy"; // the quota endpoint directly, or agy -p /usage
 }
 
 // ---------------------------------------------------------------- Claude (live)
@@ -529,12 +535,61 @@ exec "$(basename "$0")" "$@"
   return { dir, marker };
 }
 
-/** One `agy` bucket ({window, remaining_fraction, reset_time}) as a used-percent window. */
+/**
+ * One quota bucket as a used-percent window. agy's /usage JSON spells it
+ * {window, remaining_fraction, reset_time}; the endpoint {window,
+ * remainingFraction, resetTime}.
+ */
 function geminiWindow(b: any): UsageWindow | undefined {
-  if (!b || typeof b.remaining_fraction !== "number") return undefined;
-  const reset = typeof b.reset_time === "string" ? Date.parse(b.reset_time) : NaN;
-  // An untouched bucket reports the epoch: nothing to reset.
-  return { pct: Math.max(0, (1 - b.remaining_fraction) * 100), resetsAt: Number.isFinite(reset) && reset > 0 ? reset : null };
+  const remaining = b?.remaining_fraction ?? b?.remainingFraction;
+  if (typeof remaining !== "number") return undefined;
+  const r = b.reset_time ?? b.resetTime;
+  const reset = typeof r === "string" ? Date.parse(r) : NaN;
+  // An untouched bucket has no reset: agy reports the epoch, the endpoint omits it.
+  return { pct: Math.max(0, (1 - remaining) * 100), resetsAt: Number.isFinite(reset) && reset > 0 ? reset : null };
+}
+
+/** Quota groups (each a 5h and a weekly bucket) from either source. */
+function geminiGroups(raw: unknown): GeminiGroup[] {
+  const groups: GeminiGroup[] = [];
+  for (const g of Array.isArray(raw) ? raw : []) {
+    const buckets = Array.isArray(g?.buckets) ? g.buckets : [];
+    const by = (w: string) => geminiWindow(buckets.find((b: any) => b?.window === w));
+    const group = { name: String(g?.name ?? g?.displayName ?? "?"), fiveHour: by("5h"), weekly: by("weekly") };
+    if (group.fiveHour || group.weekly) groups.push(group);
+  }
+  return groups;
+}
+
+const GEMINI_QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+// The endpoint serves a consumer (Google AI plan) login's quota only to a caller
+// whose User-Agent starts with agy's product token; anything else is treated as
+// an enterprise client and refused (403 SUBSCRIPTION_REQUIRED). The version and
+// the comment aren't checked (tested 2026-11-24: antigravity/cli/0.0.1 works,
+// "ccmeter (auth_method=consumer)" doesn't), so this names ccmeter in the comment.
+const GEMINI_UA = "antigravity/cli/1.5.16 (ccmeter; auth_method=consumer)";
+const GEMINI_DIRECT_TIMEOUT_MS = 8_000;
+// agy refreshes its access token about hourly; one this close to expiry is left to it.
+const GEMINI_TOKEN_SLACK_MS = 60_000;
+
+/** The direct read, or null for the caller to fall back to agy. */
+async function getGeminiDirect(): Promise<GeminiUsage | null> {
+  if (process.env.CCMETER_GEMINI_DIRECT === "0") return null; // force the agy path (tests)
+  const t = await loadAgyToken();
+  if (!t || (t.expiresAt !== undefined && t.expiresAt - Date.now() < GEMINI_TOKEN_SLACK_MS)) return null;
+  try {
+    const r = await fetch(GEMINI_QUOTA_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${t.accessToken}`, "Content-Type": "application/json", "User-Agent": GEMINI_UA },
+      body: "{}",
+      signal: AbortSignal.timeout(GEMINI_DIRECT_TIMEOUT_MS),
+    });
+    if (!r.ok) return null;
+    const groups = geminiGroups(((await r.json()) as any)?.groups);
+    return groups.length ? { ok: true, groups, capturedAt: Date.now(), via: "api" } : null;
+  } catch {
+    return null;
+  }
 }
 
 function getGeminiUsage(): Promise<GeminiUsage> {
@@ -575,23 +630,17 @@ function getGeminiUsage(): Promise<GeminiUsage> {
       }
       if (d?.status !== "SUCCESS")
         return finish({ ok: false, error: `agy /usage: ${String(d?.error || d?.status || "failed").split("\n")[0]}` });
-      const groups: GeminiGroup[] = [];
-      for (const g of Array.isArray(d.command?.data?.groups) ? d.command.data.groups : []) {
-        const buckets = Array.isArray(g?.buckets) ? g.buckets : [];
-        const by = (w: string) => geminiWindow(buckets.find((b: any) => b?.window === w));
-        const group = { name: String(g?.name ?? "?"), fiveHour: by("5h"), weekly: by("weekly") };
-        if (group.fiveHour || group.weekly) groups.push(group);
-      }
-      finish(groups.length ? { ok: true, groups, capturedAt: Date.now() } : { ok: false, error: "agy /usage listed no quota windows" });
+      const groups = geminiGroups(d.command?.data?.groups);
+      finish(groups.length ? { ok: true, groups, capturedAt: Date.now(), via: "agy" } : { ok: false, error: "agy /usage listed no quota windows" });
     });
   });
 }
 
-// ------------------------------------------------- Gemini (cached, refreshed behind)
+// ------------------------------------------------- Gemini (direct, else agy behind a cache)
 
-// agy needs ~3 s to answer, against well under a second for everything else, so
-// a run shows the last reading at once and leaves a detached `ccmeter
-// --refresh-gemini` to fetch the next one. A run reads before printing only when
+// Without the direct read, agy needs ~3 s to answer, against well under a second
+// for everything else, so a run shows the last reading at once and leaves a
+// detached `ccmeter --refresh-gemini` to fetch the next one. A run reads before printing only when
 // there is no reading yet or it is too old to stand in for the current numbers.
 const GEMINI_FRESH_MS = 60_000; // newer than this: shown as is, no refresh started
 const GEMINI_STALE_MS = 30 * 60_000; // older than this: read before printing
@@ -611,19 +660,24 @@ function readGeminiCache(): GeminiUsage | null {
   }
 }
 
+function writeGeminiCache(u: GeminiUsage): void {
+  try {
+    const path = geminiCachePath();
+    mkdirSync(dirname(path), { recursive: true });
+    const { live: _live, ...keep } = u;
+    writeFileSync(`${path}.tmp`, JSON.stringify(keep));
+    renameSync(`${path}.tmp`, path);
+  } catch {
+    // a meter that can't cache still meters
+  }
+}
+
 /** Read agy now and keep the result (errors too, so a logged-out agy isn't retried every run). */
 async function refreshGemini(): Promise<GeminiUsage> {
   const u = await getGeminiUsage();
   if (u.absent) return u;
   const stamped = { ...u, capturedAt: u.capturedAt ?? Date.now() };
-  try {
-    const path = geminiCachePath();
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(`${path}.tmp`, JSON.stringify(stamped));
-    renameSync(`${path}.tmp`, path);
-  } catch {
-    // a meter that can't cache still meters
-  }
+  writeGeminiCache(stamped);
   return stamped;
 }
 
@@ -651,6 +705,13 @@ function refreshGeminiBehind(): void {
 }
 
 async function getGemini(): Promise<GeminiUsage> {
+  // Direct first: as fast as the Claude read. The reading is kept, so a later
+  // run that has to fall back to agy still has a recent one to show at once.
+  const direct = await getGeminiDirect();
+  if (direct) {
+    writeGeminiCache(direct);
+    return { ...direct, live: true };
+  }
   const cached = readGeminiCache();
   const age = cached ? Date.now() - cached.capturedAt! : Infinity;
   if (!cached || age >= GEMINI_STALE_MS) return { ...(await refreshGemini()), live: true };
@@ -790,11 +851,13 @@ reads it to show how the windows moved.
 Codex numbers are a live read from a short-lived \`codex app-server\`
 (account/rateLimits/read). If that fails, they are the latest snapshot
 from ~/.codex rollout logs (as fresh as your last Codex turn).
-Gemini numbers come from the Antigravity CLI (\`agy -p /usage\`), which
-spends no quota; the section is left out where agy isn't installed. agy takes
-a few seconds, so the last reading shows at once ("read 2m ago") and a
-background refresh fetches the next; a run waits for agy only when there is
-no reading yet or it is over 30 minutes old. If agy
+Gemini numbers are a live read of the quota endpoint the Antigravity CLI
+(agy) uses, with agy's token from the Keychain. When that token is missing or
+about to expire, or the call is refused, they come from \`agy -p /usage\`
+itself (no quota spent), which takes a few seconds: the last reading shows at
+once ("read 2m ago") and a background refresh fetches the next, also renewing
+agy's token. A run waits for agy only when there is no reading yet or it is
+over 30 minutes old. The section is left out where agy isn't installed. If agy
 can't read its login, ccmeter stops its sign-in attempt rather than let it
 open a browser, and reports Gemini as unreadable.`;
 

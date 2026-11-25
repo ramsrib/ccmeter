@@ -120,18 +120,23 @@ ccmeter --no-color
   it falls back to the most recent rate-limit snapshot Codex wrote to its rollout
   logs (`~/.codex/sessions/**/*.jsonl` and `*.jsonl.zst`), which is only as fresh
   as the last Codex turn on this machine, and says so (`· snapshot 4m ago`).
-- **Gemini** — live, from the Antigravity CLI: `agy --output-format json -p /usage`
-  answers in print mode without starting an agent turn or spending quota. Models
-  in a group share a 5h and a weekly window; the Gemini group always shows, and
-  the Claude/GPT group Antigravity also serves shows once it has been used. The
-  section is left out where `agy` isn't installed. `agy` takes about 3 seconds to
-  answer, so ccmeter shows the last reading at once (`· read 2m ago`) and refreshes
-  it in the background for the next run (`~/.local/state/ccmeter/gemini.json`); it
-  waits for `agy` only when there is no reading yet or the last is over 30 minutes old. Logged out, or unable to read
-  its login (the macOS Keychain is locked over ssh), `agy` starts a Google sign-in
-  that opens a browser tab and then waits. ccmeter runs it with a stub `open`
-  first on `PATH` that catches that sign-in URL and stops `agy`, and reports
-  Gemini as not logged in instead; `--check` counts it as unreadable.
+- **Gemini** — live: ccmeter reads the Antigravity CLI's (`agy`) OAuth token from the
+  macOS Keychain and asks the endpoint `agy` itself reads quota from
+  (`POST daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`). That
+  endpoint serves a consumer login's quota only to a User-Agent starting
+  `antigravity/cli`, so ccmeter sends one that also names itself. Models in a group share
+  a 5h and a weekly window; the Gemini group always shows, and the Claude/GPT group
+  Antigravity also serves shows once it has been used. When the direct read can't be used
+  (no token, one about to expire, a refused call), it falls back to
+  `agy --output-format json -p /usage`, which answers without an agent turn or quota but
+  takes about 3 seconds: that path shows the last reading at once (`· read 2m ago`) and
+  refreshes it in the background (`~/.local/state/ccmeter/gemini.json`), which also
+  renews agy's token, and waits for `agy` only with no reading or one over 30 minutes
+  old. Logged out, or unable to read its login (the Keychain is locked over ssh), `agy`
+  starts a Google sign-in that opens a browser tab and then waits; ccmeter runs it with a
+  stub `open` first on `PATH` that catches that sign-in URL and stops `agy`, and reports
+  Gemini as not logged in instead; `--check` counts it as unreadable. The section is left
+  out where `agy` isn't installed.
 
 Every run appends its readings to `~/.local/state/ccmeter/history.jsonl`
 (`$XDG_STATE_HOME` is honoured; `CCMETER_HISTORY` moves the file,

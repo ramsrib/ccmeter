@@ -4,6 +4,9 @@
 //   Claude Code : macOS Keychain ("Claude Code-credentials"), else
 //                 ~/.claude/.credentials.json  (Linux keeps it in the file).
 //   Codex       : ~/.codex/auth.json           (access token + JWT id_token).
+//   Antigravity : macOS Keychain, service "gemini", account "antigravity", as
+//   (agy)         go-keyring stores it: "go-keyring-base64:" + base64 JSON
+//                 {auth_method, token: {access_token, expiry, refresh_token, ...}}.
 
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -218,6 +221,37 @@ export async function loadCodexCreds(): Promise<CodexCreds | null> {
       accountId: oa?.chatgpt_account_id,
       planType: oa?.chatgpt_plan_type,
     };
+  } catch {
+    return null;
+  }
+}
+
+export interface AgyToken {
+  accessToken: string;
+  expiresAt?: number; // epoch ms
+}
+
+const AGY_KEYCHAIN_SERVICE = "gemini";
+const AGY_KEYCHAIN_ACCOUNT = "antigravity";
+const GO_KEYRING_PREFIX = "go-keyring-base64:";
+
+/**
+ * The Antigravity CLI's OAuth access token, read from the Keychain item agy
+ * writes through go-keyring (which goes through /usr/bin/security, so reading it
+ * the same way raises no access prompt). agy refreshes it (about hourly) when it
+ * runs; this never does. Null when absent, unreadable, or not on macOS.
+ */
+export async function loadAgyToken(): Promise<AgyToken | null> {
+  if (process.platform !== "darwin") return null;
+  const out = await stdoutOf("security", ["find-generic-password", "-s", AGY_KEYCHAIN_SERVICE, "-a", AGY_KEYCHAIN_ACCOUNT, "-w"]);
+  if (!out) return null;
+  let raw = out.trim();
+  if (raw.startsWith(GO_KEYRING_PREFIX)) raw = Buffer.from(raw.slice(GO_KEYRING_PREFIX.length), "base64").toString("utf8");
+  try {
+    const t = JSON.parse(raw)?.token;
+    if (typeof t?.access_token !== "string" || !t.access_token) return null;
+    const exp = typeof t.expiry === "string" ? Date.parse(t.expiry) : NaN;
+    return { accessToken: t.access_token, expiresAt: Number.isFinite(exp) ? exp : undefined };
   } catch {
     return null;
   }
