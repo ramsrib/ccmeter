@@ -125,7 +125,10 @@ ccmeter --no-color
   logs (`~/.codex/sessions/**/*.jsonl` and `*.jsonl.zst`), which is only as fresh
   as the last Codex turn on this machine, and says so (`· snapshot 4m ago`).
 - **Gemini** — live: ccmeter reads the Antigravity CLI's (`agy`) OAuth token from the
-  macOS Keychain and asks the endpoint `agy` itself reads quota from
+  macOS Keychain, falling back to
+  `~/.gemini/antigravity-cli/antigravity-oauth-token`. With
+  `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=true`, it reads only the file. It asks the
+  endpoint `agy` itself reads quota from
   (`POST daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`). That
   endpoint serves a consumer login's quota only to a User-Agent starting
   `antigravity/cli`, so ccmeter sends one that also names itself. Models in a group share
@@ -253,7 +256,7 @@ bin/ccmeter        sh shim: exec bun (preferred) or node against src/
 bin/ctxmeter
 bin/ccburn
 src/
-  lib/creds.ts     locate Claude / Codex / agy credentials (keychain, ~/.claude, ~/.codex)
+  lib/creds.ts     locate Claude / Codex / agy credentials (Keychain and local files)
   lib/format.ts    color, utilization bars, percent / reset-time / money formatting
   lib/history.ts   the readings log ccmeter appends and ccburn reads
   lib/walk.ts      find/read *.jsonl and *.jsonl.zst (no bun Glob, so node works too)

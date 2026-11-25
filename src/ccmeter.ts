@@ -17,12 +17,12 @@
  *            which is only as fresh as the last Codex turn on this machine.
  *   Gemini : live, from the endpoint the Antigravity CLI (agy) reads its own
  *            quota from (POST daily-cloudcode-pa.googleapis.com/v1internal:
- *            retrieveUserQuotaSummary) with agy's token from the Keychain. When
- *            that can't be used (token absent or about to expire, a refused
- *            call), agy itself: `agy -p /usage` in print mode, no agent turn
- *            and no quota spent. agy takes ~3 s to start, so that path shows
- *            the last reading at once and refreshes it in the background (see
- *            getGemini); it also refreshes agy's token for the next direct read.
+ *            retrieveUserQuotaSummary) with agy's token from the Keychain or
+ *            token file. When that can't be used (token absent or about to
+ *            expire, a refused call), agy runs `agy -p /usage` in print mode,
+ *            with no agent turn or quota spent. agy takes ~3 s to start, so
+ *            that path shows the last reading at once and refreshes it in the
+ *            background (see getGemini), also renewing agy's token.
  *            agy starts a browser sign-in when it can't read its login, so it
  *            runs behind a guard that stops it instead. Left out entirely where
  *            neither agy nor its token exists.
@@ -979,11 +979,11 @@ app-server daemon's socket when there is one, else from a short-lived
 \`codex app-server\`. If that fails, they are the latest snapshot
 from ~/.codex rollout logs (as fresh as your last Codex turn).
 Gemini numbers are a live read of the quota endpoint the Antigravity CLI
-(agy) uses, with agy's token from the Keychain. When that token is missing or
-about to expire, or the call is refused, they come from \`agy -p /usage\`
-itself (no quota spent), which takes a few seconds: the last reading shows at
-once ("read 2m ago") and a background refresh fetches the next, also renewing
-agy's token. A run waits for agy only when there is no reading yet or it is
+(agy) uses, with agy's token from the Keychain or token file. When that token
+is missing or about to expire, or the call is refused, they come from
+\`agy -p /usage\` itself (no quota spent), which takes a few seconds: the last
+reading shows at once ("read 2m ago") and a background refresh fetches the
+next, also renewing agy's token. A run waits only when there is no reading or it is
 over 30 minutes old. The section is left out where agy isn't installed. If agy
 can't read its login, ccmeter stops its sign-in attempt rather than let it
 open a browser, and reports Gemini as unreadable.`;
