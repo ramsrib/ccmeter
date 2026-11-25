@@ -54,7 +54,7 @@ export function historyPath(env: NodeJS.ProcessEnv = process.env): string {
 
 /** Append one reading. Never throws: a meter that can't write history still meters. */
 export async function appendHistory(entry: HistoryEntry): Promise<void> {
-  if (process.env.CCMETER_NO_HISTORY === "1" || (!entry.claude && !entry.codex)) return;
+  if (process.env.CCMETER_NO_HISTORY === "1" || (!entry.claude && !entry.codex && !entry.gemini)) return;
   const path = historyPath();
   try {
     await mkdir(dirname(path), { recursive: true });

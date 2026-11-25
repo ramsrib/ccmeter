@@ -207,6 +207,7 @@ ccburn --by model            # group by project (default), model or caller
 ccburn --model fable         # only Fable calls: which projects ate the Fable cap
 ccburn --timeline            # every hour, not just the five steepest
 ccburn --codex --json        # one provider, machine-readable
+ccburn --gemini --by model   # Antigravity usage by model
 ```
 
 For each provider: spend grouped by project (worktrees and temp-dir review
@@ -237,14 +238,28 @@ were asked, and the steepest hours.
   `ccmeter` history on disk, each hour also shows what the 5h and weekly windows
   read, and the default window starts at the weekly reset; without it, the last
   7 days.
+- **Gemini** reads step usage and model names from local Antigravity CLI and
+  desktop conversation databases under `~/.gemini/antigravity-cli` and
+  `~/.gemini/antigravity`. It uses the recorded conversation workspace as the
+  project and opens temporary SQLite copies, including WAL sidecars. Each
+  weekly rise in `ccmeter` history is split by tokens between calls since the
+  previous sample in the same quota group. Claude and GPT calls made through
+  Antigravity count under Gemini's “Claude and GPT models” group. Shares use
+  attributed weekly points when available and tokens otherwise. The USD
+  estimate uses [Google's published Gemini API rates](https://ai.google.dev/gemini-api/docs/pricing)
+  for models with verified prices. Rows with any unpriced usage show tokens and
+  points.
 - Sessions that run a GPT model through a gateway (Claude Code with
   `--model gpt-…` behind a proxy) log to Claude transcripts but spend Codex
   quota, so they count under Codex, with the same API-rate USD estimate.
 
-JSON totals, groups, sessions and hours include `usd` for both providers
-(equal to `cost` for Claude). Existing `cost` fields retain their meanings:
-Claude API-rate dollars, Codex weighted tokens. Codex `points`, shares and
-sorting still use weekly-window attribution, independently of USD pricing.
+JSON totals, groups, sessions and hours include `usd` where priced. The
+`cost` field is API-rate dollars for Claude, weighted tokens for Codex and
+total tokens including cached input for Gemini. Gemini also includes a
+`usage` breakdown with the same fields as Antigravity's stream JSON. Its
+`total_tokens` excludes cached input, and `output_tokens` includes thinking.
+`weeklyGroups` lists Gemini's sampled weekly ranges and attributed points per
+quota group.
 
 Only this machine's logs are read: usage from other machines, or from the
 Codex and Claude apps, shows up in Codex's percentage but not in its sessions.
@@ -257,6 +272,7 @@ bin/ctxmeter
 bin/ccburn
 src/
   lib/creds.ts     locate Claude / Codex / agy credentials (Keychain and local files)
+  lib/antigravity.ts  read local Antigravity conversation usage and workspaces
   lib/format.ts    color, utilization bars, percent / reset-time / money formatting
   lib/history.ts   the readings log ccmeter appends and ccburn reads
   lib/walk.ts      find/read *.jsonl and *.jsonl.zst (no bun Glob, so node works too)

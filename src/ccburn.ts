@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
- * ccburn — where the Claude and Codex subscription usage went.
+ * ccburn — where the Claude, Codex and Gemini subscription usage went.
  *
- * ccmeter says how much of each window is spent; this says on what. Both CLIs
- * already log everything needed, locally:
+ * ccmeter says how much of each window is spent; this says on what. It reads
+ * local usage records:
  *
  *   Claude : every transcript under ~/.claude/projects (subagents included)
  *            records each API message's model and token usage. There are no
@@ -15,13 +15,17 @@
  *            reading, so Codex shares are in real weekly-window points. Tokens
  *            are also priced at OpenAI's standard API rates, an estimate like
  *            Claude's, for comparison in USD.
+ *   Gemini : Antigravity CLI and desktop SQLite snapshots supply step usage,
+ *            model names and conversation workspaces. Each rise in ccmeter's
+ *            weekly samples is split by tokens within its own model group.
+ *            Published Gemini API rates supply USD estimates where available.
  *
  * Sessions that run a GPT model through a gateway (claude-proxy --model
  * gpt-6-sol) log to Claude transcripts but spend Codex quota, so they're
  * counted under Codex.
  *
  * Flags:  --since 6h|2d|ISO  --by project|model|caller  --model NAME  --top N  --timeline
- *         --claude | --codex  --json  --no-color  -h/--help
+ *         --claude | --codex | --gemini  --json  --no-color  -h/--help
  */
 import { VERSION } from "./lib/version.ts";
 import { parseArgs } from "node:util";
@@ -29,6 +33,7 @@ import { existsSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { readAntigravity, type AntigravityUsage } from "./lib/antigravity.ts";
 import { readHistory, type HistoryEntry } from "./lib/history.ts";
 import { codexPlanLabel, colorEnabled, makeStyle, type Style } from "./lib/format.ts";
 import { jsonlRecursive, readJsonl } from "./lib/walk.ts";
@@ -96,22 +101,64 @@ function codexUsd(model: string, fresh: number, cached: number, output: number, 
 const codexUnits = (model: string, fresh: number, cached: number, output: number) =>
   codexUsd(model, fresh, cached, output) * 1e6;
 
+// Standard paid text rates in USD per million tokens, with dated changes from
+// https://ai.google.dev/gemini-api/docs/pricing. Output already includes thinking.
+function geminiUsd(model: string, t: number, usage: AntigravityUsage): number | undefined {
+  let price: Price;
+  switch (model) {
+    case "gemini-4-neon":
+      price = { input: 3, output: 15, cacheRead: 0.15 };
+      break;
+    case "gemini-4-argon":
+    case "gemini-4-carbon":
+      price = t < Date.UTC(2026, 11, 1)
+        ? { input: 2, output: 10, cacheRead: 0.1 }
+        : { input: 4, output: 20, cacheRead: 0.2 };
+      break;
+    case "gemini-4-hydrogen":
+      price = { input: 1.5, output: 7.5, cacheRead: 0.075 };
+      break;
+    case "gemini-3.8-flash":
+    case "gemini-3.8-flash-n": // Antigravity's recorded name for Gemini 3.8 Flash
+    case "gemini-3.6-flash":
+      price = t < Date.UTC(2027, 0, 1)
+        ? { input: 0.75, output: 3.75, cacheRead: 0.075 }
+        : { input: 1.5, output: 7.5, cacheRead: 0.15 };
+      break;
+    case "gemini-3.1-pro-preview":
+    case "gemini-3.1-pro-preview-customtools":
+      price = usage.input_tokens + usage.cache_read_tokens <= 200_000
+        ? { input: 2, output: 12, cacheRead: 0.2 }
+        : { input: 4, output: 18, cacheRead: 0.4 };
+      break;
+    default:
+      return;
+  }
+  return (price.input * usage.input_tokens + price.output * usage.output_tokens +
+    price.cacheRead * usage.cache_read_tokens) / 1e6;
+}
+
 // ------------------------------------------------------------------ records
 
-type Provider = "claude" | "codex";
+type Provider = "claude" | "codex" | "gemini";
+
+interface Amount {
+  cost: number; // Claude: USD · Codex: weighted tokens · Gemini: tokens including cached input
+  usd?: number; // omitted when an API price is unavailable
+  points: number; // attributed weekly-window points
+  usage?: AntigravityUsage;
+}
 
 /** One API call's worth of spend. */
-interface Spend {
+interface Spend extends Amount {
   t: number; // epoch ms
   provider: Provider;
   session: string;
   caller: string; // main, subagent:<type>, codex exec, …
   model: string;
-  cost: number; // claude: USD at API rates · codex: weighted tokens (see codexUnits)
-  usd: number; // estimated USD at the provider's standard API rates
-  points: number; // codex: weekly-window points allocated to this call
-  tokens: { input: number; cacheWrite: number; cacheRead: number; output: number };
+  tokens?: { input: number; cacheWrite: number; cacheRead: number; output: number };
   account?: string; // codex: the ChatGPT account the rollout ran under ("" when unrecorded)
+  geminiGroup?: string;
 }
 
 interface SessionInfo {
@@ -121,11 +168,14 @@ interface SessionInfo {
   prompt: string;
 }
 
-/** A Codex weekly reading, straight from a rollout. */
-interface Reading {
+interface WeeklyReading {
   t: number;
   pct: number;
   resetsAt: number | null; // epoch ms
+}
+
+/** A Codex weekly reading, straight from a rollout. */
+interface Reading extends WeeklyReading {
   account: string; // whose meter this is; "" when the rollout doesn't record it
 }
 
@@ -436,7 +486,7 @@ function resolveRepoProjects(sessions: Map<string, SessionInfo>): void {
  * more points than the window rose. A new window is recognised by its reset
  * time moving, not by the percentage dropping.
  */
-function allocatePoints(spends: Spend[], readings: Reading[]): void {
+function allocatePoints(spends: Spend[], readings: WeeklyReading[], carryUntilRise = true): void {
   const sorted = [...spends].sort((a, b) => a.t - b.t);
   let i = 0;
   let high: number | null = null;
@@ -444,8 +494,10 @@ function allocatePoints(spends: Spend[], readings: Reading[]): void {
   let pending: Spend[] = [];
   for (const r of readings) {
     while (i < sorted.length && sorted[i]!.t <= r.t) pending.push(sorted[i++]!);
-    const newWindow = window !== null && r.resetsAt !== null && Math.abs(r.resetsAt - window) > 3600e3;
-    if (r.resetsAt !== null) window = r.resetsAt;
+    const newWindow = window !== null && (r.resetsAt !== null
+      ? Math.abs(r.resetsAt - window) > 3600e3
+      : !carryUntilRise && r.pct === 0);
+    if (r.resetsAt !== null || newWindow) window = r.resetsAt;
     if (high === null || newWindow) {
       // Nothing to measure the first reading against; after a reset the
       // points so far belong to spend we can't separate from the old window's.
@@ -454,7 +506,10 @@ function allocatePoints(spends: Spend[], readings: Reading[]): void {
       continue;
     }
     const rise = r.pct - high;
-    if (rise <= 0) continue;
+    if (rise <= 0) {
+      if (!carryUntilRise) pending = [];
+      continue;
+    }
     high = r.pct;
     const units = pending.reduce((s, x) => s + x.cost, 0);
     if (units > 0) for (const x of pending) x.points += (rise * x.cost) / units;
@@ -462,15 +517,62 @@ function allocatePoints(spends: Spend[], readings: Reading[]): void {
   }
 }
 
+// ------------------------------------------------------------------ Gemini
+
+const GEMINI_MODELS = "Gemini Models";
+const PARTNER_MODELS = "Claude and GPT models";
+
+function collectGemini(since: number, sessions: Map<string, SessionInfo>): Spend[] {
+  return readAntigravity(HOME, since).flatMap(({ id, workspace, caller, calls }) => {
+    sessions.set(id, { provider: "gemini", project: projectOf(workspace), caller, prompt: "" });
+    return calls.map(({ t, model, usage }) => ({
+      t, model, usage, caller,
+      provider: "gemini",
+      session: id,
+      geminiGroup: model.startsWith("gemini-") ? GEMINI_MODELS
+        : /^(claude|gpt)-/.test(model) ? PARTNER_MODELS : undefined,
+      cost: usage.total_tokens + usage.cache_read_tokens,
+      usd: geminiUsd(model, t, usage),
+      points: 0,
+    }));
+  });
+}
+
+function geminiWeekly(history: HistoryEntry[]): Map<string, WeeklyReading[]> {
+  const groups = new Map<string, Map<number, WeeklyReading>>();
+  for (const { at, gemini } of history) {
+    const t = gemini?.capturedAt ?? at;
+    if (!Number.isFinite(t)) continue;
+    for (const g of gemini?.groups ?? []) {
+      if (!g.weekly || !Number.isFinite(g.weekly.pct)) continue;
+      const reset = typeof g.weekly.resetsAt === "string" ? Date.parse(g.weekly.resetsAt) : g.weekly.resetsAt;
+      const samples = groups.get(g.name) ?? new Map();
+      // Several ccmeter calls can log the same cached reading.
+      samples.set(t, { t, pct: g.weekly.pct, resetsAt: reset && reset > 0 ? reset : null });
+      groups.set(g.name, samples);
+    }
+  }
+  return new Map([...groups].map(([name, samples]) => [name, [...samples.values()].sort((a, b) => a.t - b.t)]));
+}
+
 // ------------------------------------------------------------------ report
 
-interface Row {
+interface Row extends Amount {
   key: string;
-  cost: number;
-  usd: number;
-  points: number;
   calls: number;
   sessions: Set<string>;
+}
+
+function addSpend(sum: Amount, s: Spend): void {
+  sum.cost += s.cost;
+  sum.points += s.points;
+  sum.usd = sum.usd === undefined || s.usd === undefined ? undefined : sum.usd + s.usd;
+  if (!s.usage) return;
+  if (!sum.usage) {
+    sum.usage = { ...s.usage };
+    return;
+  }
+  for (const token of Object.keys(s.usage) as (keyof AntigravityUsage)[]) sum.usage[token] += s.usage[token];
 }
 
 interface Report {
@@ -478,11 +580,12 @@ interface Report {
   since: number;
   sinceWhy: string;
   model?: string; // --model filter, when given
-  total: { cost: number; usd: number; points: number; calls: number };
+  total: Amount & { calls: number };
   range?: { from: number; to: number }; // codex weekly % across the window, one account only
   accounts?: { id: string; plan: string; range?: { from: number; to: number } }[]; // codex
-  groups: { key: string; share: number; cost: number; usd: number; points: number; calls: number; sessions: number }[];
-  sessions: {
+  weeklyGroups?: { name: string; range: { from: number; to: number }; points: number }[]; // Gemini
+  groups: (Amount & { key: string; share: number; calls: number; sessions: number })[];
+  sessions: (Amount & {
     id: string;
     from: number;
     to: number;
@@ -490,11 +593,8 @@ interface Report {
     project: string;
     caller: string;
     prompt: string;
-    cost: number;
-    usd: number;
-    points: number;
-  }[];
-  hours: { hour: number; cost: number; usd: number; points: number; readings?: string }[];
+  })[];
+  hours: (Amount & { hour: number; readings?: string })[];
 }
 
 function build(
@@ -511,25 +611,22 @@ function build(
   plans: Map<string, string> = new Map(),
   accounts: string[] = [], // codex: the window's accounts, found before any --model filter
 ): Report {
-  const metric = (x: { cost: number; points: number }) => (provider === "codex" ? x.points : x.cost);
-  const total = { cost: 0, usd: 0, points: 0, calls: spends.length };
+  const byPoints = provider === "codex" || (provider === "gemini" && spends.some((s) => s.points > 0));
+  const metric = (x: Amount) => byPoints ? x.points : x.cost;
+  const total: Report["total"] = { cost: 0, usd: 0, points: 0, calls: spends.length };
   const groups = new Map<string, Row>();
   const perSession = new Map<
     string,
-    { from: number; to: number; cost: number; usd: number; points: number; sub: number; models: Map<string, number> }
+    Amount & { from: number; to: number; sub: number; models: Map<string, number> }
   >();
-  const hours = new Map<number, { cost: number; usd: number; points: number }>();
+  const hours = new Map<number, Amount>();
 
   for (const s of spends) {
-    total.cost += s.cost;
-    total.usd += s.usd;
-    total.points += s.points;
+    addSpend(total, s);
     const info = sessions.get(s.session);
     const key = by === "model" ? s.model : by === "caller" ? s.caller : (info?.project ?? "?");
     const g = groups.get(key) ?? { key, cost: 0, usd: 0, points: 0, calls: 0, sessions: new Set<string>() };
-    g.cost += s.cost;
-    g.usd += s.usd;
-    g.points += s.points;
+    addSpend(g, s);
     g.calls++;
     g.sessions.add(s.session);
     groups.set(key, g);
@@ -538,17 +635,13 @@ function build(
     if (s.caller.startsWith("subagent")) ps.sub += metric(s);
     ps.from = Math.min(ps.from, s.t);
     ps.to = Math.max(ps.to, s.t);
-    ps.cost += s.cost;
-    ps.usd += s.usd;
-    ps.points += s.points;
+    addSpend(ps, s);
     ps.models.set(s.model, (ps.models.get(s.model) ?? 0) + s.cost);
     perSession.set(s.session, ps);
 
     const h = Math.floor(s.t / 3600e3) * 3600e3;
     const hb = hours.get(h) ?? { cost: 0, usd: 0, points: 0 };
-    hb.cost += s.cost;
-    hb.usd += s.usd;
-    hb.points += s.points;
+    addSpend(hb, s);
     hours.set(h, hb);
   }
 
@@ -570,6 +663,7 @@ function build(
         points: g.points,
         calls: g.calls,
         sessions: g.sessions.size,
+        usage: g.usage,
       })),
     sessions: [...perSession.entries()]
       .sort((a, b) => metric(b[1]) - metric(a[1]))
@@ -593,6 +687,7 @@ function build(
           cost: ps.cost,
           usd: ps.usd,
           points: ps.points,
+          usage: ps.usage,
         };
       }),
     hours: [...hours.entries()].sort((a, b) => a[0] - b[0]).map(([hour, v]) => ({ hour, ...v })),
@@ -614,7 +709,7 @@ function build(
         return v.length ? [a === null ? span(v) : `${codexPlanLabel(plans.get(a)) ?? "?"} ${a.slice(0, 8)} ${span(v)}`] : [];
       });
       if (parts.length) h.readings = `read weekly ${parts.join(" · ")}`;
-    } else {
+    } else if (provider === "claude") {
       const es = history.filter((e) => e.claude && inHour(e.at));
       const five = es.map((e) => e.claude!.fiveHour?.pct).filter((x): x is number => x != null);
       const week = es.map((e) => e.claude!.weekly?.pct).filter((x): x is number => x != null);
@@ -644,12 +739,24 @@ const until = (from: number, to: number) =>
   new Date(from).toDateString() === new Date(to).toDateString() ? hhmm(to) : clock(to);
 const usd = (n: number) => (n >= 100 ? `$${Math.round(n)}` : `$${n.toFixed(2)}`);
 const pts = (n: number) => `+${n >= 10 ? n.toFixed(0) : n.toFixed(1)}%`;
+const geminiPercent = (n: number) => Number(n.toFixed(5));
+const geminiPts = (n: number) => `+${geminiPercent(n)} pp`;
+const geminiSpan = (from: number, to: number) =>
+  from === to ? `${geminiPercent(to)}%` : `${geminiPercent(from)}→${geminiPercent(to)}%`;
+const tokenCount = (n: number) => `${n.toLocaleString()} tokens`;
 const fit = (s: string, w: number) => (s.length > w ? s.slice(0, w - 1) + "…" : s.padEnd(w));
 
 function render(style: Style, r: Report, by: string, timeline: boolean): string[] {
   const codex = r.provider === "codex";
-  const amount = (x: { cost: number; usd: number; points: number }) =>
-    (codex ? `${pts(x.points)} · ${usd(x.usd)}` : usd(x.cost)).padStart(codex ? 16 : 6);
+  const gemini = r.provider === "gemini";
+  const api = (x: Amount) => x.usd === undefined ? "" : ` · ${usd(x.usd)}`;
+  const geminiAmount = (x: Amount) => `${geminiPts(x.points)} · ${tokenCount(x.cost)}${api(x)}`;
+  const width = gemini
+    ? [...r.groups, ...r.sessions, ...r.hours].reduce((n, x) => Math.max(n, geminiAmount(x).length), 0)
+    : codex ? 16 : 6;
+  const amount = (x: Amount) => gemini
+    ? geminiAmount(x).padStart(width)
+    : (codex ? `${pts(x.points)} · ${usd(x.usd!)}` : usd(x.cost)).padStart(width);
   const pctRange = (x: { from: number; to: number }) => `${Math.round(x.from)}→${Math.round(x.to)}%`;
   const accts = r.accounts ?? [];
   const weekly =
@@ -658,14 +765,21 @@ function render(style: Style, r: Report, by: string, timeline: boolean): string[
       : r.range
         ? `weekly ${pctRange(r.range)}, ${pts(r.total.points)} attributed`
         : "no weekly readings in this window";
-  const title = codex ? (accts.length === 1 ? `Codex (${codexPlanLabel(accts[0]!.plan)} · ${accts[0]!.id.slice(0, 8)})` : "Codex") : "Claude";
+  const title = codex ? (accts.length === 1 ? `Codex (${codexPlanLabel(accts[0]!.plan)} · ${accts[0]!.id.slice(0, 8)})` : "Codex") : gemini ? "Gemini" : "Claude";
   const headline = codex
-    ? `${weekly} · ${usd(r.total.usd)} at API rates`
-    : `${usd(r.total.cost)} at API rates`;
+    ? `${weekly} · ${usd(r.total.usd!)} at API rates`
+    : gemini
+      ? `${tokenCount(r.total.cost)}${r.total.usd === undefined ? "" : `${api(r.total)} at API rates`}`
+      : `${usd(r.total.cost)} at API rates`;
   const lines = [
     `${style.bold(title)}  ${style.dim(`· since ${clock(r.since)} (${r.sinceWhy})${r.model ? ` · ${r.model} calls only` : ""} · ${headline} · ${r.total.calls} calls`)}`,
   ];
   if (!r.total.calls) return [...lines, `  ${style.dim("nothing spent in this window")}`];
+  if (gemini) {
+    for (const g of r.weeklyGroups ?? [])
+      lines.push(`  ${style.dim(`${g.name} weekly ${geminiSpan(g.range.from, g.range.to)} · ${geminiPts(g.points)} attributed`)}`);
+    if (!r.weeklyGroups?.length) lines.push(`  ${style.dim("no weekly readings in this window")}`);
+  }
 
   lines.push(`  ${style.gray(`by ${by}`)}`);
   for (const g of r.groups)
@@ -676,12 +790,12 @@ function render(style: Style, r: Report, by: string, timeline: boolean): string[
   lines.push(`  ${style.gray("top sessions")}`);
   for (const s of r.sessions) {
     lines.push(
-      `    ${amount(s)}  ${clock(s.from)}–${until(s.from, s.to)}  ${fit(s.model.replace(/^claude-/, ""), 12)} ${fit(s.project, 30)} ${style.dim(s.caller)}`,
+      `    ${amount(s)}  ${clock(s.from)}–${until(s.from, s.to)}  ${fit(gemini ? s.model : s.model.replace(/^claude-/, ""), gemini ? 24 : 12)} ${fit(s.project, 30)} ${style.dim(s.caller)}`,
     );
     if (s.prompt) lines.push(`${" ".repeat(codex ? 22 : 12)}${style.dim(`"${s.prompt.slice(0, 110)}${s.prompt.length > 110 ? "…" : ""}"`)}`);
   }
 
-  const metric = (h: { cost: number; points: number }) => (codex ? h.points : h.cost);
+  const metric = (h: Amount) => (codex || (gemini && r.total.points > 0)) ? h.points : h.cost;
   const hours = timeline ? r.hours : [...r.hours].sort((a, b) => metric(b) - metric(a)).slice(0, 5);
   lines.push(`  ${style.gray(timeline ? "by hour" : "steepest hours")}`);
   for (const h of hours)
@@ -691,10 +805,10 @@ function render(style: Style, r: Report, by: string, timeline: boolean): string[
 
 // ------------------------------------------------------------------ main
 
-const HELP = `ccburn — where the Claude and Codex subscription usage went
+const HELP = `ccburn — where the Claude, Codex and Gemini subscription usage went
 
 usage: ccburn [--since 6h|2d|1w|DATE] [--by project|model|caller] [--model NAME]
-              [--top N] [--timeline] [--claude | --codex] [--json] [--no-color]
+              [--top N] [--timeline] [--claude] [--codex] [--gemini] [--json] [--no-color]
 
   --since      window start (default: the start of each provider's current
                weekly window, else the last 7 days)
@@ -703,7 +817,7 @@ usage: ccburn [--since 6h|2d|1w|DATE] [--by project|model|caller] [--model NAME]
                a model-scoped cap like Fable's went, subagent calls included
   --top N      rows per table (default: 8)
   --timeline   every hour, instead of the five steepest
-  --claude, --codex   one provider only
+  --claude, --codex, --gemini   select providers (combine any)
   --json       machine-readable
   -V, --version   print the version
 
@@ -713,6 +827,9 @@ weekly-window points, from the percentages Codex records next to each turn,
 alongside an estimate in USD at OpenAI's standard API rates. Unknown Codex
 models use gpt-6.1-sol rates; requests above 272K input tokens use long-context
 rates. Plain (.jsonl) and compressed (.jsonl.zst) rollouts are read.
+Gemini uses local Antigravity conversation tokens and ccmeter weekly readings
+for each model group. Models with published Gemini API rates also show an
+estimated USD amount. Other Gemini subscription models show tokens and points.
 Only this machine's logs are read.`;
 
 async function main() {
@@ -726,6 +843,7 @@ async function main() {
       timeline: { type: "boolean", default: false },
       claude: { type: "boolean", default: false },
       codex: { type: "boolean", default: false },
+      gemini: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       "no-color": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -740,7 +858,7 @@ async function main() {
   }
   if (!["project", "model", "caller"].includes(values.by!)) throw new Error(`--by: expected project, model or caller`);
   const top = Math.max(1, Number(values.top) || 8);
-  const want = (p: Provider) => (!values.claude && !values.codex) || values[p];
+  const want = (p: Provider) => (!values.claude && !values.codex && !values.gemini) || values[p];
   // Per call, not per session: a session is labelled by its costliest model,
   // so Fable subagents under an Opus session would otherwise never show.
   const model = values.model?.toLowerCase();
@@ -751,11 +869,12 @@ async function main() {
   // Read a little more than a week so the window start can be found first.
   const scanFrom = explicit ?? now - WEEK_MS - 86400e3;
   const sessions = new Map<string, SessionInfo>();
-  const [claudeAll, codexData, history] = await Promise.all([
-    collectClaude(scanFrom, sessions),
+  const [claudeAll, codexData, meterHistory] = await Promise.all([
+    want("claude") || want("codex") ? collectClaude(scanFrom, sessions) : Promise.resolve([]),
     want("codex") ? collectCodex(scanFrom, sessions) : Promise.resolve({ spends: [], readings: [], plans: new Map() }),
-    readHistory(scanFrom),
+    readHistory(want("gemini") ? scanFrom - WEEK_MS : scanFrom),
   ]);
+  const history = meterHistory.filter((e) => e.at >= scanFrom);
 
   resolveRepoProjects(sessions);
 
@@ -821,6 +940,40 @@ async function main() {
       ),
     );
   }
+  if (want("gemini")) {
+    const weekly = [...geminiWeekly(meterHistory)].map(([name, samples]) => {
+      const [from] = since(windowStart(samples.at(-1)?.resetsAt));
+      const first = samples.findIndex((sample) => sample.t >= from);
+      // Keep the preceding sample so a mid-interval --since still allocates
+      // that rise across all its calls, even the ones outside the report.
+      return { name, from, samples: first < 0 ? [] : samples.slice(Math.max(0, first - 1)) };
+    });
+    const [fallback, fallbackWhy] = since(null);
+    const geminiSessions = new Map<string, SessionInfo>();
+    const all = collectGemini(Math.min(fallback, ...weekly.map((g) => Math.min(g.from, g.samples[0]?.t ?? g.from))), geminiSessions);
+    for (const g of weekly) allocatePoints(all.filter((s) => s.geminiGroup === g.name), g.samples, false);
+    if (all.length) {
+      const starts = new Map(weekly.map((g) => [g.name, g.from]));
+      const fromFor = (s: Spend) => starts.get(s.geminiGroup ?? "") ?? fallback;
+      const from = all.reduce((earliest, s) => Math.min(earliest, fromFor(s)), Math.min(...weekly.map((g) => g.from)));
+      const spends = all.filter((s) => s.t >= fromFor(s) && ofModel(s));
+      const report = build("gemini", spends, geminiSessions, from, from === fallback ? fallbackWhy : "weekly window",
+        values.by!, top, [], [], values.model);
+      report.weeklyGroups = weekly.flatMap(({ name, samples }) => samples.length ? [{
+        name,
+        range: { from: samples[0]!.pct, to: samples.at(-1)!.pct },
+        points: spends.filter((s) => s.geminiGroup === name).reduce((sum, s) => sum + s.points, 0),
+      }] : []);
+      for (const hour of report.hours) {
+        const parts = weekly.flatMap(({ name, from, samples }) => {
+          const seen = samples.filter((sample) => sample.t >= Math.max(hour.hour, from) && sample.t < hour.hour + 3600e3);
+          return seen.length ? [`${name} ${geminiSpan(seen[0]!.pct, seen.at(-1)!.pct)}`] : [];
+        });
+        if (parts.length) hour.readings = `read weekly ${parts.join(" · ")}`;
+      }
+      reports.push(report);
+    }
+  }
 
   if (values.json) {
     const out: Record<string, Report> = {};
@@ -828,7 +981,7 @@ async function main() {
     return console.log(JSON.stringify({ ...out, generatedAt: new Date(now).toISOString() }, null, 2));
   }
   const style = makeStyle(values["no-color"] ? false : colorEnabled());
-  console.log(reports.map((r) => render(style, r, values.by!, values.timeline!).join("\n")).join("\n\n"));
+  if (reports.length) console.log(reports.map((r) => render(style, r, values.by!, values.timeline!).join("\n")).join("\n\n"));
 }
 
 main().catch((e) => {
