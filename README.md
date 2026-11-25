@@ -124,7 +124,10 @@ ccmeter --no-color
   answers in print mode without starting an agent turn or spending quota. Models
   in a group share a 5h and a weekly window; the Gemini group always shows, and
   the Claude/GPT group Antigravity also serves shows once it has been used. The
-  section is left out where `agy` isn't installed. Logged out, or unable to read
+  section is left out where `agy` isn't installed. `agy` takes about 3 seconds to
+  answer, so ccmeter shows the last reading at once (`· read 2m ago`) and refreshes
+  it in the background for the next run (`~/.local/state/ccmeter/gemini.json`); it
+  waits for `agy` only when there is no reading yet or the last is over 30 minutes old. Logged out, or unable to read
   its login (the macOS Keychain is locked over ssh), `agy` starts a Google sign-in
   that opens a browser tab and then waits. ccmeter runs it with a stub `open`
   first on `PATH` that catches that sign-in URL and stops `agy`, and reports

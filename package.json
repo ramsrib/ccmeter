@@ -1,8 +1,8 @@
 {
   "name": "ccmeter",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "type": "module",
-  "description": "Usage meters for Claude Code and Codex — ccmeter watches the subscription budget, ctxmeter watches the context window, ccburn shows where the budget went.",
+  "description": "Usage meters for Claude Code and Codex \u2014 ccmeter watches the subscription budget, ctxmeter watches the context window, ccburn shows where the budget went.",
   "license": "MIT",
   "repository": {
     "type": "git",

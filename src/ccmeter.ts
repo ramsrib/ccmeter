@@ -14,19 +14,20 @@
  *            old, logged out, offline), the most recent rate-limit snapshot
  *            Codex persisted to its rollout logs (~/.codex/sessions/**.jsonl),
  *            which is only as fresh as the last Codex turn on this machine.
- *   Gemini : live, from the Antigravity CLI's own quota read (`agy -p /usage`
- *            in print mode: no agent turn, no quota spent). Left out entirely
- *            where agy isn't installed. agy starts a browser sign-in when it
- *            can't read its login, so the read runs behind a guard that stops
- *            it instead (see getGeminiUsage).
+ *   Gemini : from the Antigravity CLI's own quota read (`agy -p /usage` in
+ *            print mode: no agent turn, no quota spent). Left out entirely
+ *            where agy isn't installed. agy takes ~3 s to start, so the last
+ *            reading is shown at once and refreshed in the background (see
+ *            getGemini). agy starts a browser sign-in when it can't read its
+ *            login, so the read runs behind a guard that stops it instead.
  *
  * Flags:  --json   machine-readable output  |  --direct  |  --no-color  |  -h/--help
  */
 import { parseArgs } from "node:util";
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { claudeRouteFromEnv, loadClaudeCreds, routeAuth, type ClaudeRoute } from "./lib/creds.ts";
 import { appendHistory } from "./lib/history.ts";
 import { jsonlRecursive, readJsonl } from "./lib/walk.ts";
@@ -102,6 +103,8 @@ interface GeminiUsage {
   absent?: boolean; // agy not installed: not an error, the section is left out
   error?: string;
   groups?: GeminiGroup[];
+  capturedAt?: number; // epoch ms of the agy read
+  live?: boolean; // read during this run, not the cached reading
 }
 
 // ---------------------------------------------------------------- Claude (live)
@@ -579,9 +582,80 @@ function getGeminiUsage(): Promise<GeminiUsage> {
         const group = { name: String(g?.name ?? "?"), fiveHour: by("5h"), weekly: by("weekly") };
         if (group.fiveHour || group.weekly) groups.push(group);
       }
-      finish(groups.length ? { ok: true, groups } : { ok: false, error: "agy /usage listed no quota windows" });
+      finish(groups.length ? { ok: true, groups, capturedAt: Date.now() } : { ok: false, error: "agy /usage listed no quota windows" });
     });
   });
+}
+
+// ------------------------------------------------- Gemini (cached, refreshed behind)
+
+// agy needs ~3 s to answer, against well under a second for everything else, so
+// a run shows the last reading at once and leaves a detached `ccmeter
+// --refresh-gemini` to fetch the next one. A run reads before printing only when
+// there is no reading yet or it is too old to stand in for the current numbers.
+const GEMINI_FRESH_MS = 60_000; // newer than this: shown as is, no refresh started
+const GEMINI_STALE_MS = 30 * 60_000; // older than this: read before printing
+const GEMINI_LOCK_MS = 60_000; // one background refresh at a time
+
+function geminiCachePath(env: NodeJS.ProcessEnv = process.env): string {
+  const state = env.XDG_STATE_HOME || join(homedir(), ".local", "state");
+  return join(state, "ccmeter", "gemini.json");
+}
+
+function readGeminiCache(): GeminiUsage | null {
+  try {
+    const u = JSON.parse(readFileSync(geminiCachePath(), "utf8"));
+    return u && typeof u === "object" && typeof u.capturedAt === "number" ? (u as GeminiUsage) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read agy now and keep the result (errors too, so a logged-out agy isn't retried every run). */
+async function refreshGemini(): Promise<GeminiUsage> {
+  const u = await getGeminiUsage();
+  if (u.absent) return u;
+  const stamped = { ...u, capturedAt: u.capturedAt ?? Date.now() };
+  try {
+    const path = geminiCachePath();
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(`${path}.tmp`, JSON.stringify(stamped));
+    renameSync(`${path}.tmp`, path);
+  } catch {
+    // a meter that can't cache still meters
+  }
+  return stamped;
+}
+
+/** Start a detached refresh unless one started within GEMINI_LOCK_MS. */
+function refreshGeminiBehind(): void {
+  const lock = `${geminiCachePath()}.refresh`;
+  try {
+    if (Date.now() - statSync(lock).mtimeMs < GEMINI_LOCK_MS) return;
+  } catch {
+    // no lock: go ahead
+  }
+  try {
+    mkdirSync(dirname(lock), { recursive: true });
+    writeFileSync(lock, String(process.pid));
+    const child = spawn(process.execPath, [...process.execArgv, process.argv[1], "--refresh-gemini"], {
+      detached: true,
+      stdio: "ignore",
+      cwd: tmpdir(),
+    });
+    child.on("error", () => {});
+    child.unref();
+  } catch {
+    // the cached reading still shows
+  }
+}
+
+async function getGemini(): Promise<GeminiUsage> {
+  const cached = readGeminiCache();
+  const age = cached ? Date.now() - cached.capturedAt! : Infinity;
+  if (!cached || age >= GEMINI_STALE_MS) return { ...(await refreshGemini()), live: true };
+  if (age >= GEMINI_FRESH_MS) refreshGeminiBehind();
+  return { ...cached, live: false };
 }
 
 // ---------------------------------------------------------------------- rendering
@@ -678,8 +752,9 @@ function renderCodex(style: Style, u: CodexUsage): string[] {
  * been used, labelled by its name.
  */
 function renderGemini(style: Style, u: GeminiUsage): string[] {
-  if (!u.ok) return [providerHeader(style, "Gemini", undefined, ""), `  ${style.red(u.error ?? "unavailable")}`];
-  const lines = [providerHeader(style, "Gemini", undefined, "live")];
+  const age = u.live || !u.capturedAt ? "live" : `read ${humanAgo(Date.now() - u.capturedAt)}`;
+  if (!u.ok) return [providerHeader(style, "Gemini", undefined, u.live ? "" : age), `  ${style.red(u.error ?? "unavailable")}`];
+  const lines = [providerHeader(style, "Gemini", undefined, age)];
   for (const g of u.groups ?? []) {
     const main = /^gemini/i.test(g.name);
     const used = (g.fiveHour?.pct ?? 0) > 0 || (g.weekly?.pct ?? 0) > 0;
@@ -716,7 +791,10 @@ Codex numbers are a live read from a short-lived \`codex app-server\`
 (account/rateLimits/read). If that fails, they are the latest snapshot
 from ~/.codex rollout logs (as fresh as your last Codex turn).
 Gemini numbers come from the Antigravity CLI (\`agy -p /usage\`), which
-spends no quota; the section is left out where agy isn't installed. If agy
+spends no quota; the section is left out where agy isn't installed. agy takes
+a few seconds, so the last reading shows at once ("read 2m ago") and a
+background refresh fetches the next; a run waits for agy only when there is
+no reading yet or it is over 30 minutes old. If agy
 can't read its login, ccmeter stops its sign-in attempt rather than let it
 open a browser, and reports Gemini as unreadable.`;
 
@@ -730,6 +808,7 @@ async function main() {
       direct: { type: "boolean", default: false },
       "no-color": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
+      "refresh-gemini": { type: "boolean", default: false }, // internal: the background refresh
     },
     allowPositionals: false,
   });
@@ -738,8 +817,13 @@ async function main() {
     console.log(HELP);
     return;
   }
+  if (values["refresh-gemini"]) {
+    await refreshGemini();
+    rmSync(`${geminiCachePath()}.refresh`, { force: true });
+    return;
+  }
 
-  const [claude, codex, gemini] = await Promise.all([getClaudeUsage(values.direct), getCodexUsage(), getGeminiUsage()]);
+  const [claude, codex, gemini] = await Promise.all([getClaudeUsage(values.direct), getCodexUsage(), getGemini()]);
   await appendHistory({
     at: Date.now(),
     claude: claude.ok
@@ -753,7 +837,7 @@ async function main() {
         }
       : undefined,
     codex: codex.ok ? { capturedAt: codex.capturedAt, fiveHour: codex.fiveHour, weekly: codex.weekly } : undefined,
-    gemini: gemini.ok ? { groups: gemini.groups } : undefined,
+    gemini: gemini.ok ? { capturedAt: gemini.capturedAt, groups: gemini.groups } : undefined,
   });
 
   if (values.check) {

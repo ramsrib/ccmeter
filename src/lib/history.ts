@@ -36,6 +36,7 @@ export interface HistoryEntry {
   };
   // Antigravity (agy): one pair of windows per model group.
   gemini?: {
+    capturedAt?: number; // when agy was read; a run may show a cached reading
     groups?: { name: string; fiveHour?: HistoryWindow; weekly?: HistoryWindow }[];
   };
 }
